@@ -31,12 +31,19 @@ import anthropic
 
 PORTFOLIO_FILE = "portfolio.json"
 MODEL = "claude-sonnet-4-6"
-WATCHLIST_MAX = 15
+WATCHLIST_MAX_US = 15
+WATCHLIST_MAX_SG = 5
 
 
 def load_portfolio():
     with open(PORTFOLIO_FILE, "r") as f:
-        return json.load(f)
+        portfolio = json.load(f)
+    # Migrate the old single "watchlist" key (US-only) to the new split format.
+    if "watchlist" in portfolio and "watchlist_us" not in portfolio:
+        portfolio["watchlist_us"] = portfolio.pop("watchlist")
+    portfolio.setdefault("watchlist_us", [])
+    portfolio.setdefault("watchlist_sg", [])
+    return portfolio
 
 
 def fetch_snapshot(ticker):
@@ -155,22 +162,33 @@ padding it."""
     return "\n".join(text_parts)
 
 
-def get_watchlist_suggestions(current_watchlist, holdings_tickers, watchlist_snapshots):
-    """Ask Claude to propose adds/drops for the watchlist based on today's
-    market trends, then return a structured decision. Returns a dict:
+def get_watchlist_suggestions(region_label, current_watchlist, holdings_tickers, watchlist_snapshots, max_size):
+    """Ask Claude to propose adds/drops for one region's watchlist based on
+    today's market trends, then return a structured decision. Returns a dict:
     {"add": [...], "remove": [...], "reasoning": {ticker: "why"}}
     """
     client = anthropic.Anthropic()
 
-    prompt = f"""You are curating a stock watchlist for a personal investor who
-manually reviews it via daily emails. Today's date: {datetime.now().strftime('%Y-%m-%d')}.
+    market_context = {
+        "US": "US-listed stocks (NYSE/NASDAQ). Use plain US tickers (e.g. AAPL, MSFT).",
+        "SG": (
+            "SGX-listed (Singapore) stocks. Use Yahoo Finance SGX ticker format, "
+            "i.e. the SGX code followed by '.SI' (e.g. D05.SI for DBS, Z74.SI for "
+            "Singtel). Do not propose US tickers here."
+        ),
+    }[region_label]
+
+    prompt = f"""You are curating a {region_label} stock watchlist for a personal
+investor who reviews it via daily emails. Today's date: {datetime.now().strftime('%Y-%m-%d')}.
+Market: {market_context}
 
 Current watchlist: {current_watchlist}
 Current watchlist price/trend data: {json.dumps(watchlist_snapshots, indent=2)}
 Tickers already owned (do not add these, they're tracked separately): {holdings_tickers}
 
 Using web search, find current market trends, sector momentum, notable analyst
-upgrades/downgrades, and meaningful pullbacks or breakouts from the last few days.
+upgrades/downgrades, and meaningful pullbacks or breakouts from the last few days
+in this specific market.
 
 Decide:
 1. Which current watchlist names, if any, should be DROPPED - because the thesis
@@ -180,8 +198,8 @@ Decide:
    rotation, meaningful valuation shift) - not just "this is a well-known company."
    Don't add a name just to fill space.
 
-The watchlist should never exceed {WATCHLIST_MAX} names total. Be selective -
-it is fine to propose zero adds or zero drops on a quiet day.
+The watchlist should never exceed {max_size} names total. Be selective - it is
+fine to propose zero adds or zero drops on a quiet day.
 
 Respond with ONLY a JSON object, no other text, no markdown fences, in this exact
 shape:
@@ -223,8 +241,8 @@ If there are no changes, return {{"add": [], "remove": [], "reasoning": {{}}}}."
     return decision
 
 
-def apply_watchlist_changes(portfolio, decision, holdings_tickers):
-    watchlist = list(portfolio.get("watchlist", []))
+def apply_watchlist_changes(watchlist, decision, holdings_tickers, max_size):
+    watchlist = list(watchlist)
     changes_made = []
 
     for ticker in decision["remove"]:
@@ -235,13 +253,12 @@ def apply_watchlist_changes(portfolio, decision, holdings_tickers):
     for ticker in decision["add"]:
         if ticker in holdings_tickers or ticker in watchlist:
             continue
-        if len(watchlist) >= WATCHLIST_MAX:
+        if len(watchlist) >= max_size:
             break
         watchlist.append(ticker)
         changes_made.append(f"- Added {ticker}: {decision['reasoning'].get(ticker, '')}")
 
-    portfolio["watchlist"] = watchlist
-    return portfolio, changes_made
+    return watchlist, changes_made
 
 
 def save_portfolio(portfolio):
@@ -264,33 +281,56 @@ def send_email(subject, body):
 def main():
     portfolio = load_portfolio()
     holdings = portfolio.get("holdings", [])
-    watchlist = portfolio.get("watchlist", [])
+    watchlist_us = portfolio.get("watchlist_us", [])
+    watchlist_sg = portfolio.get("watchlist_sg", [])
 
     snapshots = {h["ticker"]: fetch_snapshot(h["ticker"]) for h in holdings}
-    watchlist_snapshots = [fetch_snapshot(t) for t in watchlist]
+    us_snapshots = [fetch_snapshot(t) for t in watchlist_us]
+    sg_snapshots = [fetch_snapshot(t) for t in watchlist_sg]
 
     holdings_rows, total_cost, total_value = build_holdings_table(holdings, snapshots)
     table = format_table(holdings_rows) if holdings_rows else "(no holdings logged yet)"
 
     try:
-        analysis = get_claude_analysis(holdings_rows, watchlist_snapshots, total_cost, total_value)
+        analysis = get_claude_analysis(
+            holdings_rows, us_snapshots + sg_snapshots, total_cost, total_value
+        )
     except Exception as e:
         analysis = f"[Claude analysis failed: {e}]"
 
     holdings_tickers = [h["ticker"] for h in holdings]
-    watchlist_changes = []
-    try:
-        decision = get_watchlist_suggestions(watchlist, holdings_tickers, watchlist_snapshots)
-        portfolio, watchlist_changes = apply_watchlist_changes(portfolio, decision, holdings_tickers)
-        if watchlist_changes:
-            save_portfolio(portfolio)
-    except Exception as e:
-        watchlist_changes = [f"[Watchlist update failed: {e}]"]
 
-    watchlist_change_text = (
-        "\n".join(watchlist_changes) if watchlist_changes else "(no changes today)"
-    )
-    updated_watchlist_text = ", ".join(portfolio.get("watchlist", [])) or "(empty)"
+    all_changes = []
+    try:
+        us_decision = get_watchlist_suggestions(
+            "US", watchlist_us, holdings_tickers, us_snapshots, WATCHLIST_MAX_US
+        )
+        watchlist_us, us_changes = apply_watchlist_changes(
+            watchlist_us, us_decision, holdings_tickers, WATCHLIST_MAX_US
+        )
+        all_changes += [f"[US] {c}" for c in us_changes]
+    except Exception as e:
+        all_changes.append(f"[US watchlist update failed: {e}]")
+
+    try:
+        sg_decision = get_watchlist_suggestions(
+            "SG", watchlist_sg, holdings_tickers, sg_snapshots, WATCHLIST_MAX_SG
+        )
+        watchlist_sg, sg_changes = apply_watchlist_changes(
+            watchlist_sg, sg_decision, holdings_tickers, WATCHLIST_MAX_SG
+        )
+        all_changes += [f"[SG] {c}" for c in sg_changes]
+    except Exception as e:
+        all_changes.append(f"[SG watchlist update failed: {e}]")
+
+    portfolio["watchlist_us"] = watchlist_us
+    portfolio["watchlist_sg"] = watchlist_sg
+    if all_changes:
+        save_portfolio(portfolio)
+
+    watchlist_change_text = "\n".join(all_changes) if all_changes else "(no changes today)"
+    us_watchlist_text = ", ".join(watchlist_us) or "(empty)"
+    sg_watchlist_text = ", ".join(watchlist_sg) or "(empty)"
 
     overall_pl_pct = (
         round((total_value - total_cost) / total_cost * 100, 2) if total_cost else 0
@@ -315,7 +355,8 @@ WATCHLIST CHANGES TODAY
 --------------------------------------------------
 {watchlist_change_text}
 
-Current watchlist: {updated_watchlist_text}
+US watchlist: {us_watchlist_text}
+SG watchlist: {sg_watchlist_text}
 
 --------------------------------------------------
 This is an automated research note, not financial advice. Data may be delayed
