@@ -4,5 +4,7 @@
     { "ticker": "PLTR", "shares": 1, "cost_basis": 129.80, "date_bought": "2026-07-14" }
   ],
   "watchlist": [],
+  "watchlist_sg": ["D05.SI", "Z74.SI", "C52.SI", "S63.SI", "9CI.SI"],
   "closed_positions": []
 }
+
