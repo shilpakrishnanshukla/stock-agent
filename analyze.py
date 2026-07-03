@@ -31,6 +31,7 @@ import anthropic
 
 PORTFOLIO_FILE = "portfolio.json"
 MODEL = "claude-sonnet-4-6"
+WATCHLIST_MAX = 15
 
 
 def load_portfolio():
@@ -154,6 +155,101 @@ padding it."""
     return "\n".join(text_parts)
 
 
+def get_watchlist_suggestions(current_watchlist, holdings_tickers, watchlist_snapshots):
+    """Ask Claude to propose adds/drops for the watchlist based on today's
+    market trends, then return a structured decision. Returns a dict:
+    {"add": [...], "remove": [...], "reasoning": {ticker: "why"}}
+    """
+    client = anthropic.Anthropic()
+
+    prompt = f"""You are curating a stock watchlist for a personal investor who
+manually reviews it via daily emails. Today's date: {datetime.now().strftime('%Y-%m-%d')}.
+
+Current watchlist: {current_watchlist}
+Current watchlist price/trend data: {json.dumps(watchlist_snapshots, indent=2)}
+Tickers already owned (do not add these, they're tracked separately): {holdings_tickers}
+
+Using web search, find current market trends, sector momentum, notable analyst
+upgrades/downgrades, and meaningful pullbacks or breakouts from the last few days.
+
+Decide:
+1. Which current watchlist names, if any, should be DROPPED - because the thesis
+   played out, the catalyst passed, or something changed the picture for the worse.
+2. Which NEW tickers, if any, deserve to be ADDED - because something genuinely
+   interesting is happening today (a real catalyst, notable analyst action, sector
+   rotation, meaningful valuation shift) - not just "this is a well-known company."
+   Don't add a name just to fill space.
+
+The watchlist should never exceed {WATCHLIST_MAX} names total. Be selective -
+it is fine to propose zero adds or zero drops on a quiet day.
+
+Respond with ONLY a JSON object, no other text, no markdown fences, in this exact
+shape:
+{{
+  "add": ["TICKER1", "TICKER2"],
+  "remove": ["TICKER3"],
+  "reasoning": {{"TICKER1": "one sentence why", "TICKER3": "one sentence why dropped"}}
+}}
+If there are no changes, return {{"add": [], "remove": [], "reasoning": {{}}}}."""
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}],
+        tools=[{"type": "web_search_20250305", "name": "web_search"}],
+    )
+
+    text_parts = [block.text for block in response.content if block.type == "text"]
+    raw = "\n".join(text_parts).strip()
+
+    # Be defensive: strip stray markdown fences if the model adds them anyway,
+    # and grab the JSON object even if there's stray text around it.
+    if "```" in raw:
+        raw = raw.split("```")[1] if raw.count("```") >= 2 else raw
+        raw = raw.replace("json", "", 1).strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1:
+        raw = raw[start:end + 1]
+
+    try:
+        decision = json.loads(raw)
+    except Exception:
+        decision = {"add": [], "remove": [], "reasoning": {}}
+
+    decision.setdefault("add", [])
+    decision.setdefault("remove", [])
+    decision.setdefault("reasoning", {})
+    return decision
+
+
+def apply_watchlist_changes(portfolio, decision, holdings_tickers):
+    watchlist = list(portfolio.get("watchlist", []))
+    changes_made = []
+
+    for ticker in decision["remove"]:
+        if ticker in watchlist:
+            watchlist.remove(ticker)
+            changes_made.append(f"- Dropped {ticker}: {decision['reasoning'].get(ticker, '')}")
+
+    for ticker in decision["add"]:
+        if ticker in holdings_tickers or ticker in watchlist:
+            continue
+        if len(watchlist) >= WATCHLIST_MAX:
+            break
+        watchlist.append(ticker)
+        changes_made.append(f"- Added {ticker}: {decision['reasoning'].get(ticker, '')}")
+
+    portfolio["watchlist"] = watchlist
+    return portfolio, changes_made
+
+
+def save_portfolio(portfolio):
+    with open(PORTFOLIO_FILE, "w") as f:
+        json.dump(portfolio, f, indent=2)
+        f.write("\n")
+
+
 def send_email(subject, body):
     msg = MIMEText(body)
     msg["Subject"] = subject
@@ -181,6 +277,21 @@ def main():
     except Exception as e:
         analysis = f"[Claude analysis failed: {e}]"
 
+    holdings_tickers = [h["ticker"] for h in holdings]
+    watchlist_changes = []
+    try:
+        decision = get_watchlist_suggestions(watchlist, holdings_tickers, watchlist_snapshots)
+        portfolio, watchlist_changes = apply_watchlist_changes(portfolio, decision, holdings_tickers)
+        if watchlist_changes:
+            save_portfolio(portfolio)
+    except Exception as e:
+        watchlist_changes = [f"[Watchlist update failed: {e}]"]
+
+    watchlist_change_text = (
+        "\n".join(watchlist_changes) if watchlist_changes else "(no changes today)"
+    )
+    updated_watchlist_text = ", ".join(portfolio.get("watchlist", [])) or "(empty)"
+
     overall_pl_pct = (
         round((total_value - total_cost) / total_cost * 100, 2) if total_cost else 0
     )
@@ -198,6 +309,13 @@ Overall unrealized P/L: {overall_pl_pct}%
 ANALYSIS
 --------------------------------------------------
 {analysis}
+
+--------------------------------------------------
+WATCHLIST CHANGES TODAY
+--------------------------------------------------
+{watchlist_change_text}
+
+Current watchlist: {updated_watchlist_text}
 
 --------------------------------------------------
 This is an automated research note, not financial advice. Data may be delayed
