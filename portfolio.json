@@ -1,27 +1,5 @@
 {
-  "holdings": [
-    {
-      "ticker": "BMY",
-      "shares": 50,
-      "cost_basis": 56.80,
-      "date_bought": "2026-07-03",
-      "notes": "example row - replace with your real position"
-    }
-  ],
-  "watchlist": [
-    "MRK",
-    "MU",
-    "AMD",
-    "OSCR"
-  ],
-  "closed_positions": [
-    {
-      "ticker": "EXAMPLE_SOLD_STOCK",
-      "shares": 10,
-      "cost_basis": 100.00,
-      "sold_price": 120.00,
-      "date_bought": "2026-01-01",
-      "date_sold": "2026-06-01"
-    }
-  ]
+  "holdings": [],
+  "watchlist": [],
+  "closed_positions": []
 }
