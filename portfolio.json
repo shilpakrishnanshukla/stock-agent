@@ -1,14 +1,8 @@
 {
-  "holdings": [],
-  "watchlist": [
-    "META",
-    "MU",
-    "PLTR",
-    "APP",
-    "CYTK",
-    "CRM",
-    "NOW",
-    "JPM"
+  "holdings": [
+    { "ticker": "CRM", "shares": 1, "cost_basis": 166.19, "date_bought": "2026-07-14" },
+    { "ticker": "PLTR", "shares": 1, "cost_basis": 129.80, "date_bought": "2026-07-14" }
   ],
+  "watchlist": [],
   "closed_positions": []
 }
