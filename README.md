@@ -59,7 +59,25 @@ fine for this, no need for git on your machine):
   (your actual purchase price), and `date_bought`.
 - **Sell**: remove it from `holdings` and add it to `closed_positions` with
   `sold_price` and `date_sold`, so you keep a record.
-- **Just want to watch it**: add the ticker to `watchlist`.
+
+## The watchlist is now self-maintaining
+
+You no longer need to hand-edit the watchlist. Every run, the script asks
+Claude (with live web search) to look at current market trends, sector
+momentum, and analyst activity, then:
+
+- **drops** names whose thesis has played out or gone stale
+- **adds** names where something genuinely new is happening (a real catalyst,
+  analyst action, valuation shift) - not just well-known tickers for the sake
+  of it
+
+It's capped at 15 names so it doesn't run away. Every change is explained in
+the email under "WATCHLIST CHANGES TODAY," and the script commits the updated
+`portfolio.json` back to the repo automatically after each run - so what you
+see on GitHub always reflects the latest list.
+
+You can still manually add or remove watchlist names any time by editing the
+file yourself; the automated run will just keep curating from there.
 
 ## Adjusting the schedule
 
