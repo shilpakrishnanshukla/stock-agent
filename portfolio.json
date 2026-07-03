@@ -1,5 +1,14 @@
 {
   "holdings": [],
-  "watchlist": [],
+  "watchlist": [
+    "META",
+    "MU",
+    "PLTR",
+    "APP",
+    "CYTK",
+    "CRM",
+    "NOW",
+    "JPM"
+  ],
   "closed_positions": []
 }
