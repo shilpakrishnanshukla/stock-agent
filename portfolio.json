@@ -1,17 +1,10 @@
 {
   "holdings": [
-    {
-      "ticker": "CRM",
-      "shares": 1,
-      "cost_basis": 166.19,
-      "date_bought": "2026-07-14"
-    },
-    {
-      "ticker": "PLTR",
-      "shares": 1,
-      "cost_basis": 129.8,
-      "date_bought": "2026-07-14"
-    }
+   { "ticker": "CRM", "shares": 1, "cost_basis": 166.19, "date_bought": "2026-07-6" },
+    { "ticker": "PLTR", "shares": 1, "cost_basis": 129.80, "date_bought": "2026-07-6" },
+    { "ticker": "S68.SI", "shares": 100, "cost_basis": 24.05, "date_bought": "2026-07-6" },
+    { "ticker": "Z74.SI", "shares": 100, "cost_basis": 4.47, "date_bought": "2026-07-6" },
+    { "ticker": "C52.SI", "shares": 200, "cost_basis": 1.34, "date_bought": "2026-07-6" }
   ],
   "watchlist_sg": [
     "D05.SI",
