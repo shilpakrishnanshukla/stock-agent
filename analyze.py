@@ -301,6 +301,15 @@ def main():
     holdings_tickers = [h["ticker"] for h in holdings]
 
     all_changes = []
+
+    # If a watchlist name has since been bought, it belongs only in holdings now.
+    auto_removed_us = [t for t in watchlist_us if t in holdings_tickers]
+    auto_removed_sg = [t for t in watchlist_sg if t in holdings_tickers]
+    watchlist_us = [t for t in watchlist_us if t not in holdings_tickers]
+    watchlist_sg = [t for t in watchlist_sg if t not in holdings_tickers]
+    all_changes += [f"[US] - Removed {t}: now an actual holding, tracked there instead" for t in auto_removed_us]
+    all_changes += [f"[SG] - Removed {t}: now an actual holding, tracked there instead" for t in auto_removed_sg]
+
     try:
         us_decision = get_watchlist_suggestions(
             "US", watchlist_us, holdings_tickers, us_snapshots, WATCHLIST_MAX_US
