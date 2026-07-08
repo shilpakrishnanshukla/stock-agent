@@ -60,24 +60,40 @@ fine for this, no need for git on your machine):
 - **Sell**: remove it from `holdings` and add it to `closed_positions` with
   `sold_price` and `date_sold`, so you keep a record.
 
-## The watchlist is now self-maintaining
+## The watchlist is now a weighted scoring system (US only)
 
-You no longer need to hand-edit the watchlist. Every run, the script asks
-Claude (with live web search) to look at current market trends, sector
-momentum, and analyst activity, then:
+The SG watchlist stays paused. The US watchlist is screened daily across ~150
+liquid US stocks and every candidate is scored out of **55 points** across
+three categories, then the **top 15 scorers** (whatever their score) become
+the watchlist:
 
-- **drops** names whose thesis has played out or gone stale
-- **adds** names where something genuinely new is happening (a real catalyst,
-  analyst action, valuation shift) - not just well-known tickers for the sake
-  of it
+**Category 1 - Trend (25 pts)**
+- Price above 20-day EMA: +10
+- 20-day EMA above 50-day EMA: +10
+- Higher highs (last 10 sessions' high above the prior 10 sessions' high): +5
 
-It's capped at 15 names so it doesn't run away. Every change is explained in
-the email under "WATCHLIST CHANGES TODAY," and the script commits the updated
-`portfolio.json` back to the repo automatically after each run - so what you
-see on GitHub always reflects the latest list.
+**Category 2 - Momentum (20 pts)**
+- RSI(14) 50-60: +10 / 60-65: +8 / 65-70: +5 / above 70: +0
+- Volume vs the 20-day average: above average: +10 / in line with average: +5 / below average: +0
 
-You can still manually add or remove watchlist names any time by editing the
-file yourself; the automated run will just keep curating from there.
+**Category 3 - Earnings impact (10 pts)**
+- Earnings within the next 5 trading days: +0
+- Earnings in 6-10 trading days: +5
+- Earnings further out (or none found): +10
+
+Every email shows the full score breakdown per ticker (total, and each
+category's sub-score) alongside the underlying numbers (price, 20EMA, 50EMA,
+RSI, volume ratio, days to next earnings). Changes are logged with the actual
+score for both drops and adds, and the updated `portfolio.json` is committed
+back to the repo automatically, same as before.
+
+Note: earnings dates come from Yahoo Finance's calendar data, which isn't
+always populated for every ticker - if no date is found, it's treated as "no
+near-term earnings risk visible" and scored favorably (+10), rather than
+penalized for missing data.
+
+You can still manually add or remove names from `watchlist_us`; the next
+automated run will re-score and re-rank from there regardless.
 
 ## Adjusting the schedule
 
