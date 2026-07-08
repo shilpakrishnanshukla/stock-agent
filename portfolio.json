@@ -1,5 +1,21 @@
 {
   "holdings": [],
-  "watchlist_us": [],
+  "watchlist_us": [
+    "PPG",
+    "D",
+    "DDOG",
+    "ED",
+    "SHOP",
+    "EXC",
+    "NET",
+    "PANW",
+    "PCG",
+    "SO",
+    "SYK",
+    "CSX",
+    "UPS",
+    "ABBV",
+    "AXP"
+  ],
   "closed_positions": []
 }
