@@ -1,21 +1,21 @@
 {
   "holdings": [],
   "watchlist_us": [
-    "JPM",
-    "PANW",
-    "TGT",
-    "VRTX",
-    "PSX",
-    "TMO",
-    "V",
+    "DHR",
+    "OXY",
+    "SHOP",
+    "AMAT",
+    "RTX",
+    "ICE",
+    "NVDA",
+    "TXN",
+    "PLTR",
+    "COP",
+    "EMR",
+    "STZ",
+    "TEAM",
     "VLO",
-    "IBM",
-    "ABNB",
-    "AEP",
-    "APD",
-    "AVB",
-    "BA",
-    "CL"
+    "ADSK"
   ],
   "closed_positions": []
 }
