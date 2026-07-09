@@ -28,6 +28,7 @@ Required environment variables (set as GitHub Actions secrets, see README):
 """
 
 import json
+import math
 import os
 import smtplib
 import sys
@@ -67,6 +68,13 @@ US_CANDIDATE_UNIVERSE = [
 ]
 
 
+DEFAULT_TRADE_SETTINGS = {
+    "portfolio_value": 10_000,
+    "max_risk_pct": 0.01,
+    "max_position_pct": 0.15,
+}
+
+
 def load_portfolio():
     with open(PORTFOLIO_FILE, "r") as f:
         portfolio = json.load(f)
@@ -76,6 +84,9 @@ def load_portfolio():
     portfolio.setdefault("watchlist_us", [])
     portfolio.setdefault("holdings", [])
     portfolio.setdefault("closed_positions", [])
+    settings = portfolio.setdefault("trade_settings", {})
+    for key, default in DEFAULT_TRADE_SETTINGS.items():
+        settings.setdefault(key, default)
     return portfolio
 
 
@@ -291,6 +302,48 @@ def reward_risk(entry, support, resistance, buffer_pct=0.005):
         "risk": round(risk, 2),
         "reward": round(reward, 2),
         "reward_risk": round(rr, 2),
+    }
+
+
+def calculate_trade_plan(
+    ticker,
+    entry_price,
+    stop_price,
+    target_price,
+    portfolio_value=10_000,
+    max_risk_pct=0.01,
+    max_position_pct=0.15,
+):
+    """Position sizing for a final shortlisted ticker: how many shares to
+    buy so that neither the dollar risk (stop hit) nor the position size
+    exceeds the configured caps."""
+    max_risk_dollars = portfolio_value * max_risk_pct
+    max_position_dollars = portfolio_value * max_position_pct
+    risk_per_share = entry_price - stop_price
+    profit_per_share = target_price - entry_price
+    if risk_per_share <= 0 or profit_per_share <= 0:
+        return None
+    shares_by_risk = max_risk_dollars / risk_per_share
+    shares_by_position = max_position_dollars / entry_price
+    shares = math.floor(min(shares_by_risk, shares_by_position))
+    investment = shares * entry_price
+    max_loss = shares * risk_per_share
+    max_profit = shares * profit_per_share
+    reward_risk_ratio = profit_per_share / risk_per_share
+    return {
+        "ticker": ticker,
+        "entry": entry_price,
+        "stop_loss": stop_price,
+        "target_sell": target_price,
+        "risk_per_share": round(risk_per_share, 2),
+        "profit_per_share": round(profit_per_share, 2),
+        "shares": shares,
+        "investment": round(investment, 2),
+        "max_loss": round(max_loss, 2),
+        "max_profit": round(max_profit, 2),
+        "reward_risk": round(reward_risk_ratio, 2),
+        "position_limit": round(max_position_dollars, 2),
+        "risk_limit": round(max_risk_dollars, 2),
     }
 
 
@@ -516,11 +569,20 @@ def score_ticker(ind, earnings_days):
     }
 
 
+BASE_SCORE_MINIMUM = 45  # out of 55 (Trend + Momentum + Earnings only)
+REWARD_RISK_MINIMUM = 2.5
+
+
 def screen_watchlist(current_watchlist, holdings_tickers):
-    """Scores the full candidate universe and takes the top WATCHLIST_MAX_US
-    scorers as the new watchlist, after first rejecting any candidate whose
-    reward:risk is below 2.5. Returns (new_watchlist, changes_log,
-    indicators_by_ticker, scores_by_ticker).
+    """Two-stage gate, then rank:
+      Stage 1: reject anything scoring below BASE_SCORE_MINIMUM out of 55 on
+               Trend + Momentum + Earnings alone (the original three
+               categories, before Location/reward:risk is even considered).
+      Stage 2: of what's left, reject anything with reward:risk below
+               REWARD_RISK_MINIMUM.
+      Then rank survivors by total score (out of 85, Location included) and
+      take the top WATCHLIST_MAX_US.
+    Returns (new_watchlist, changes_log, indicators_by_ticker, scores_by_ticker).
     """
     universe = sorted(set(US_CANDIDATE_UNIVERSE) | set(current_watchlist))
     universe = [t for t in universe if t not in holdings_tickers]
@@ -528,18 +590,32 @@ def screen_watchlist(current_watchlist, holdings_tickers):
     indicators = compute_technical_indicators(universe)
 
     scores = {}
-    rejected_rr = {}  # ticker -> actual R:R, for tickers rejected by the R:R floor
+    rejected_base = {}  # ticker -> base score, failed stage 1
+    rejected_rr = {}    # ticker -> R:R value, failed stage 2
+
     for ticker in universe:
         ind = indicators.get(ticker)
         if not ind:
             continue
 
-        rr_data = ind.get("reward_risk")
-        if rr_data is not None and rr_data["reward_risk"] < 2.5:
-            rejected_rr[ticker] = rr_data["reward_risk"]
-            continue  # hard reject: R:R below 2.5, don't even score it in
-
+        # Stage 1: base score (Trend + Momentum + Earnings) must clear the minimum.
+        trend_score, _ = score_trend(ind)
+        momentum_score, _ = score_momentum(ind)
         earnings_days = get_earnings_trading_days_away(ticker)
+        earnings_score, _ = score_earnings(earnings_days)
+        base_score = trend_score + momentum_score + earnings_score
+
+        if base_score < BASE_SCORE_MINIMUM:
+            rejected_base[ticker] = base_score
+            continue
+
+        # Stage 2: reward:risk must clear the minimum.
+        rr_data = ind.get("reward_risk")
+        rr_value = rr_data["reward_risk"] if rr_data else None
+        if rr_value is None or rr_value < REWARD_RISK_MINIMUM:
+            rejected_rr[ticker] = rr_value
+            continue
+
         scores[ticker] = score_ticker(ind, earnings_days)
 
     ranked = sorted(scores.items(), key=lambda kv: kv[1]["total"], reverse=True)
@@ -550,14 +626,20 @@ def screen_watchlist(current_watchlist, holdings_tickers):
     new_set = set(new_watchlist)
 
     for ticker in old_set - new_set:
-        if ticker in rejected_rr:
-            changes.append(f"- Dropped {ticker}: reward:risk {rejected_rr[ticker]} below the 2.5 floor")
-            continue
-        s = scores.get(ticker)
-        if s:
-            changes.append(f"- Dropped {ticker}: score {s['total']}/85, no longer in the top {WATCHLIST_MAX_US}")
+        if ticker in rejected_base:
+            changes.append(
+                f"- Dropped {ticker}: base score {rejected_base[ticker]}/55 "
+                f"below the {BASE_SCORE_MINIMUM} minimum (Trend+Momentum+Earnings)"
+            )
+        elif ticker in rejected_rr:
+            rr_str = rejected_rr[ticker] if rejected_rr[ticker] is not None else "n/a (no confirmed levels)"
+            changes.append(f"- Dropped {ticker}: reward:risk {rr_str} below the {REWARD_RISK_MINIMUM} floor")
         else:
-            changes.append(f"- Dropped {ticker}: insufficient data to score")
+            s = scores.get(ticker)
+            if s:
+                changes.append(f"- Dropped {ticker}: score {s['total']}/85, no longer in the top {WATCHLIST_MAX_US}")
+            else:
+                changes.append(f"- Dropped {ticker}: insufficient data to score")
 
     for ticker in new_set - old_set:
         s = scores[ticker]
@@ -641,6 +723,53 @@ def format_levels_table(watchlist, indicators):
     return "\n".join(lines) if watchlist else "(watchlist is empty)"
 
 
+def build_trade_plans(watchlist, indicators, trade_settings):
+    """Computes a position-sizing trade plan for each shortlisted ticker,
+    using its already-computed stop (support minus buffer) and target
+    (resistance) from the reward:risk calc. Returns {ticker: plan_or_None}."""
+    plans = {}
+    for ticker in watchlist:
+        ind = indicators.get(ticker)
+        if not ind or not ind.get("reward_risk"):
+            plans[ticker] = None
+            continue
+        rr = ind["reward_risk"]
+        plans[ticker] = calculate_trade_plan(
+            ticker=ticker,
+            entry_price=ind["price"],
+            stop_price=rr["stop"],
+            target_price=rr["target"],
+            portfolio_value=trade_settings["portfolio_value"],
+            max_risk_pct=trade_settings["max_risk_pct"],
+            max_position_pct=trade_settings["max_position_pct"],
+        )
+    return plans
+
+
+def format_trade_plan_table(watchlist, plans):
+    lines = []
+    header = (
+        f"{'TICKER':8}{'ENTRY':>9}{'STOP':>9}{'TARGET':>9}"
+        f"{'SHARES':>8}{'INVEST':>10}{'MAX LOSS':>10}{'MAX PROFIT':>12}{'R:R':>6}"
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+    for ticker in watchlist:
+        plan = plans.get(ticker)
+        if not plan:
+            lines.append(f"{ticker:8}  (no valid trade plan - risk or reward not positive)")
+            continue
+        if plan["shares"] <= 0:
+            lines.append(f"{ticker:8}  (position size rounds to 0 shares at current caps)")
+            continue
+        lines.append(
+            f"{ticker:8}{plan['entry']:>9.2f}{plan['stop_loss']:>9.2f}{plan['target_sell']:>9.2f}"
+            f"{plan['shares']:>8}{plan['investment']:>10.2f}{plan['max_loss']:>10.2f}"
+            f"{plan['max_profit']:>12.2f}{plan['reward_risk']:>5.2f}x"
+        )
+    return "\n".join(lines) if watchlist else "(watchlist is empty)"
+
+
 def send_email(subject, body):
     msg = MIMEText(body)
     msg["Subject"] = subject
@@ -688,6 +817,10 @@ def main():
     watchlist_table = format_watchlist_table(watchlist_us, indicators, scores)
     levels_table = format_levels_table(watchlist_us, indicators)
 
+    trade_settings = portfolio["trade_settings"]
+    trade_plans = build_trade_plans(watchlist_us, indicators, trade_settings)
+    trade_plan_table = format_trade_plan_table(watchlist_us, trade_plans)
+
     overall_pl_pct = (
         round((total_value - total_cost) / total_cost * 100, 2) if total_cost else 0
     )
@@ -713,7 +846,7 @@ Trend (25): price>20EMA +10, 20EMA>50EMA +10, higher highs +5
 Momentum (20): RSI 50-60 +10 / 60-65 +8 / 65-70 +5 / >70 +0; Volume vs 20-day avg: above +10 / in line with +5 / below +0
 Earnings (10): earnings within 5 trading days +0, within 6-10 +5, else +10
 Location (30): near support (<=3% +15 / <=6% +10 / <=10% +5), room below resistance (>=8% +5 / >=5% +3), reward:risk (>=4 +10 / >=3 +8 / >=2.5 +5)
-Any ticker with reward:risk below 2.5 is rejected outright and never scored in.
+Two-stage gate: Stage 1 rejects anything below 45/55 on Trend+Momentum+Earnings alone. Stage 2 (of what's left) rejects reward:risk below 2.5. Survivors are ranked by total score out of 85 (Location included).
 
 {watchlist_table}
 
@@ -728,6 +861,17 @@ Stop = support minus a 0.5% buffer. Target = nearest resistance. R:R = reward / 
 "n/a" means no confirmed pivot was found on that side within the lookback window.
 
 {levels_table}
+
+--------------------------------------------------
+TRADE PLAN (position sizing on shortlisted names)
+--------------------------------------------------
+Assumes portfolio value ${trade_settings['portfolio_value']:,.0f}, max risk per trade
+{trade_settings['max_risk_pct']*100:.1f}% (${trade_settings['portfolio_value']*trade_settings['max_risk_pct']:,.2f}),
+max position size {trade_settings['max_position_pct']*100:.1f}% (${trade_settings['portfolio_value']*trade_settings['max_position_pct']:,.2f}).
+Adjust these in portfolio.json under "trade_settings". Shares = the smaller of
+(risk cap / risk per share) and (position cap / entry price), rounded down.
+
+{trade_plan_table}
 
 --------------------------------------------------
 This is an automated research note, not financial advice. Data may be delayed
