@@ -63,11 +63,25 @@ fine for this, no need for git on your machine):
 ## The watchlist is now a weighted scoring system (US only)
 
 The SG watchlist stays paused. The US watchlist is screened daily across ~150
-liquid US stocks and every candidate is scored out of **85 points** across
-four categories, then the **top 15 scorers** become the watchlist - but with
-one hard gate first: **any ticker whose reward:risk comes out below 2.5 is
-rejected outright**, before it's even scored, regardless of how well it does
-on everything else.
+liquid US stocks using a **two-stage gate**, then ranked:
+
+**Stage 1 - base score minimum.** Trend + Momentum + Earnings (the original
+three categories, out of 55) must score **at least 45/55**. Anything below
+that is rejected immediately - it never even reaches the reward:risk check.
+
+**Stage 2 - reward:risk minimum.** Of what clears Stage 1, anything with a
+reward:risk below **2.5** is also rejected. If no confirmed support/resistance
+exists at all (so reward:risk can't be computed), that also fails this stage
+- there's no way to confirm a favorable setup without a real number.
+
+**Then rank and cap.** Whatever survives both gates is ranked by total score
+out of 85 (Trend+Momentum+Earnings+Location), and the **top 15** become the
+watchlist.
+
+This means a technically strong-looking name (great trend, great RSI) still
+gets rejected if its risk/reward at current price isn't favorable, and a
+name with a great reward:risk still gets rejected if its underlying trend and
+momentum are weak. Both conditions have to hold.
 
 **Category 1 - Trend (25 pts)**
 - Price above 20-day EMA: +10
@@ -88,18 +102,15 @@ on everything else.
 - Earnings in 6-10 trading days: +5
 - Earnings further out (or none found): +10
 
-**Category 4 - Location vs support/resistance (30 pts)**
+**Category 4 - Location vs support/resistance (30 pts, only scored for names that clear both gates above)**
 - Nearest support = closest confirmed pivot low below the current price;
   nearest resistance = closest confirmed pivot high above it
 - Distance above support: <=3% away: +15 / <=6%: +10 / <=10%: +5 / further: +0
 - Room below resistance: >=8%: +5 / >=5%: +3 / less: +0
 - Reward:risk (target = resistance, stop = support minus a 0.5% buffer):
-  >=4: +10 / >=3: +8 / >=2.5: +5
-- If no confirmed support or resistance pivot exists nearby at all, this
-  category simply scores 0 rather than being penalized further
-- **Reject rule**: if reward:risk works out below 2.5, the ticker is dropped
-  from consideration entirely for that day's watchlist - it's a hard floor,
-  not just a scoring deduction
+  >=4: +10 / >=3: +8 / >=2.5: +5 (anything below 2.5, or with no confirmed
+  levels at all, was already rejected at Stage 2 and never reaches this
+  scoring step)
 
 Every email shows the full score breakdown per ticker (total out of 85, plus
 each category's sub-score) alongside the underlying numbers (price, 20EMA,
@@ -118,6 +129,38 @@ penalized for missing data.
 You can still manually add or remove names from `watchlist_us`; the next
 automated run will re-score, re-rank, and re-apply the R:R floor from there
 regardless.
+
+## Trade plan (position sizing)
+
+Every ticker that survives the two-stage gate also gets an actual position
+size, using the entry/stop/target already computed from the pivot-based
+support/resistance:
+
+- **Max risk per trade** = portfolio value x max risk % (default 1%)
+- **Max position size** = portfolio value x max position % (default 15%)
+- **Shares** = the smaller of (risk cap / risk per share) and (position cap /
+  entry price), rounded down - whichever constraint binds first
+- Shows entry, stop, target, shares, dollar investment, max dollar loss, max
+  dollar profit, and the reward:risk ratio for each name
+
+These three inputs live in `portfolio.json` under a `trade_settings` key:
+
+```json
+"trade_settings": {
+  "portfolio_value": 10000,
+  "max_risk_pct": 0.01,
+  "max_position_pct": 0.15
+}
+```
+
+Edit these any time to match your actual account size and risk tolerance -
+the next run picks up the new values automatically. If you don't add this
+key at all, it defaults to the values above and gets added to the file
+automatically on the next run.
+
+This is a sizing calculation based on the stop/target already derived from
+technical levels, not a recommendation of how much you personally should
+risk - adjust the percentages to whatever you're actually comfortable with.
 
 ## Adjusting the schedule
 
