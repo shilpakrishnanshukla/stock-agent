@@ -2,8 +2,9 @@ name: Daily Stock Note
 
 on:
   schedule:
-    # 21:30 UTC = 5:30pm US Eastern (after market close), Mon-Fri
-    - cron: "30 21 * * 1-5"
+    # 12:00 UTC = 8:00pm SGT = ~8:00am US Eastern (during EDT) - lands right
+    # in the US pre-market window (4:00am-9:30am ET), Mon-Fri
+    - cron: "0 12 * * 1-5"
   workflow_dispatch: {}  # lets you trigger it manually from the Actions tab too
 
 permissions:
