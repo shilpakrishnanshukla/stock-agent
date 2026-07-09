@@ -63,14 +63,21 @@ fine for this, no need for git on your machine):
 ## The watchlist is now a weighted scoring system (US only)
 
 The SG watchlist stays paused. The US watchlist is screened daily across ~150
-liquid US stocks and every candidate is scored out of **55 points** across
-three categories, then the **top 15 scorers** (whatever their score) become
-the watchlist:
+liquid US stocks and every candidate is scored out of **85 points** across
+four categories, then the **top 15 scorers** become the watchlist - but with
+one hard gate first: **any ticker whose reward:risk comes out below 2.5 is
+rejected outright**, before it's even scored, regardless of how well it does
+on everything else.
 
 **Category 1 - Trend (25 pts)**
 - Price above 20-day EMA: +10
 - 20-day EMA above 50-day EMA: +10
-- Higher highs (last 10 sessions' high above the prior 10 sessions' high): +5
+- Higher highs: +5 - based on actual confirmed swing pivots (a bar whose
+  high is the highest within 2 bars either side), not a rough rolling-window
+  comparison. The most recent pivot high must sit above the one before it.
+  The same pivot logic also tracks higher lows, shown in the email table for
+  context (HH/HL flags and the actual pivot price levels), though only
+  higher highs currently affects the score, matching your original spec.
 
 **Category 2 - Momentum (20 pts)**
 - RSI(14) 50-60: +10 / 60-65: +8 / 65-70: +5 / above 70: +0
@@ -81,11 +88,27 @@ the watchlist:
 - Earnings in 6-10 trading days: +5
 - Earnings further out (or none found): +10
 
-Every email shows the full score breakdown per ticker (total, and each
-category's sub-score) alongside the underlying numbers (price, 20EMA, 50EMA,
-RSI, volume ratio, days to next earnings). Changes are logged with the actual
-score for both drops and adds, and the updated `portfolio.json` is committed
-back to the repo automatically, same as before.
+**Category 4 - Location vs support/resistance (30 pts)**
+- Nearest support = closest confirmed pivot low below the current price;
+  nearest resistance = closest confirmed pivot high above it
+- Distance above support: <=3% away: +15 / <=6%: +10 / <=10%: +5 / further: +0
+- Room below resistance: >=8%: +5 / >=5%: +3 / less: +0
+- Reward:risk (target = resistance, stop = support minus a 0.5% buffer):
+  >=4: +10 / >=3: +8 / >=2.5: +5
+- If no confirmed support or resistance pivot exists nearby at all, this
+  category simply scores 0 rather than being penalized further
+- **Reject rule**: if reward:risk works out below 2.5, the ticker is dropped
+  from consideration entirely for that day's watchlist - it's a hard floor,
+  not just a scoring deduction
+
+Every email shows the full score breakdown per ticker (total out of 85, plus
+each category's sub-score) alongside the underlying numbers (price, 20EMA,
+50EMA, RSI, volume ratio, pivot levels, days to next earnings). A separate
+table also shows support, resistance, stop, target, risk, reward, and R:R for
+each ticker directly, sorted best R:R first. Changes are logged with the
+actual reasoning for both drops and adds - including a specific "reward:risk
+below 2.5 floor" note when that's why something didn't make the cut - and the
+updated `portfolio.json` is committed back to the repo automatically.
 
 Note: earnings dates come from Yahoo Finance's calendar data, which isn't
 always populated for every ticker - if no date is found, it's treated as "no
@@ -93,7 +116,8 @@ near-term earnings risk visible" and scored favorably (+10), rather than
 penalized for missing data.
 
 You can still manually add or remove names from `watchlist_us`; the next
-automated run will re-score and re-rank from there regardless.
+automated run will re-score, re-rank, and re-apply the R:R floor from there
+regardless.
 
 ## Adjusting the schedule
 
