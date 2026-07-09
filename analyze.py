@@ -641,7 +641,7 @@ def format_levels_table(watchlist, indicators):
     return "\n".join(lines) if watchlist else "(watchlist is empty)"
 
 
-
+def send_email(subject, body):
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = os.environ["EMAIL_ADDRESS"]
