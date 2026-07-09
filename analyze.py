@@ -706,6 +706,7 @@ def score_ticker(ind, earnings_days):
 
 BASE_SCORE_MINIMUM = 45  # out of 55 (Trend + Momentum + Earnings only)
 REWARD_RISK_MINIMUM = 2.5
+STAGE1_SHORTLIST_SIZE = 20
 
 
 def screen_watchlist(current_watchlist, holdings_tickers):
@@ -713,27 +714,29 @@ def screen_watchlist(current_watchlist, holdings_tickers):
       Stage 1: reject anything scoring below BASE_SCORE_MINIMUM out of 55 on
                Trend + Momentum + Earnings alone (the original three
                categories, before Location/reward:risk is even considered).
-      Stage 2: of what's left, reject anything with reward:risk below
-               REWARD_RISK_MINIMUM.
-      Then rank survivors by total score (out of 85, Location included) and
-      take the top WATCHLIST_MAX_US.
-    Returns (new_watchlist, changes_log, indicators_by_ticker, scores_by_ticker).
+               The top STAGE1_SHORTLIST_SIZE survivors (by base score) are
+               kept as the Stage 1 shortlist shown in the email.
+      Stage 2: of that Stage 1 shortlist, reject anything with reward:risk
+               below REWARD_RISK_MINIMUM.
+      Then rank Stage 2 survivors by total score (out of 85, Location
+      included) and take the top WATCHLIST_MAX_US as the final watchlist.
+    Returns (new_watchlist, changes_log, indicators_by_ticker, scores_by_ticker,
+    stage1_shortlist, stage2_eliminated) where:
+      stage1_shortlist = list of dicts for the top 20 that cleared Stage 1
+      stage2_eliminated = list of dicts for Stage 1 survivors cut at Stage 2
     """
     universe = sorted(set(US_CANDIDATE_UNIVERSE) | set(current_watchlist))
     universe = [t for t in universe if t not in holdings_tickers]
 
     indicators = compute_technical_indicators(universe)
 
-    scores = {}
-    rejected_base = {}  # ticker -> base score, failed stage 1
-    rejected_rr = {}    # ticker -> R:R value, failed stage 2
+    stage1_candidates = []  # everything that cleared the base score minimum
 
     for ticker in universe:
         ind = indicators.get(ticker)
         if not ind:
             continue
 
-        # Stage 1: base score (Trend + Momentum + Earnings) must clear the minimum.
         trend_score, _ = score_trend(ind)
         momentum_score, _ = score_momentum(ind)
         earnings_days = get_earnings_trading_days_away(ticker)
@@ -741,40 +744,65 @@ def screen_watchlist(current_watchlist, holdings_tickers):
         base_score = trend_score + momentum_score + earnings_score
 
         if base_score < BASE_SCORE_MINIMUM:
-            rejected_base[ticker] = base_score
             continue
 
-        # Stage 2: reward:risk must clear the minimum.
+        stage1_candidates.append({
+            "ticker": ticker,
+            "base_score": base_score,
+            "trend": trend_score,
+            "momentum": momentum_score,
+            "earnings": earnings_score,
+            "earnings_days": earnings_days,
+        })
+
+    # Keep only the top N by base score as the Stage 1 shortlist that
+    # actually proceeds to the reward:risk check - matches "show me the
+    # first 20 it shortlisted" rather than every single Stage 1 passer.
+    stage1_candidates.sort(key=lambda c: c["base_score"], reverse=True)
+    stage1_shortlist = stage1_candidates[:STAGE1_SHORTLIST_SIZE]
+
+    scores = {}
+    stage2_eliminated = []
+
+    for candidate in stage1_shortlist:
+        ticker = candidate["ticker"]
+        ind = indicators[ticker]
         rr_data = ind.get("reward_risk")
         rr_value = rr_data["reward_risk"] if rr_data else None
+
         if rr_value is None or rr_value < REWARD_RISK_MINIMUM:
-            rejected_rr[ticker] = rr_value
+            stage2_eliminated.append({
+                "ticker": ticker,
+                "base_score": candidate["base_score"],
+                "reward_risk": rr_value,
+            })
             continue
 
-        scores[ticker] = score_ticker(ind, earnings_days)
+        scores[ticker] = score_ticker(ind, candidate["earnings_days"])
 
     ranked = sorted(scores.items(), key=lambda kv: kv[1]["total"], reverse=True)
     new_watchlist = [ticker for ticker, _ in ranked[:WATCHLIST_MAX_US]]
+
+    # Simple day-over-day diff, same as before, for the "changes today" log.
+    rejected_base_lookup = {
+        c["ticker"]: c["base_score"] for c in stage1_candidates if c["base_score"] < BASE_SCORE_MINIMUM
+    }
+    rejected_rr_lookup = {e["ticker"]: e["reward_risk"] for e in stage2_eliminated}
 
     changes = []
     old_set = set(current_watchlist)
     new_set = set(new_watchlist)
 
     for ticker in old_set - new_set:
-        if ticker in rejected_base:
-            changes.append(
-                f"- Dropped {ticker}: base score {rejected_base[ticker]}/55 "
-                f"below the {BASE_SCORE_MINIMUM} minimum (Trend+Momentum+Earnings)"
-            )
-        elif ticker in rejected_rr:
-            rr_str = rejected_rr[ticker] if rejected_rr[ticker] is not None else "n/a (no confirmed levels)"
+        if ticker in rejected_rr_lookup:
+            rr_str = rejected_rr_lookup[ticker] if rejected_rr_lookup[ticker] is not None else "n/a (no confirmed levels)"
             changes.append(f"- Dropped {ticker}: reward:risk {rr_str} below the {REWARD_RISK_MINIMUM} floor")
         else:
             s = scores.get(ticker)
             if s:
                 changes.append(f"- Dropped {ticker}: score {s['total']}/85, no longer in the top {WATCHLIST_MAX_US}")
             else:
-                changes.append(f"- Dropped {ticker}: insufficient data to score")
+                changes.append(f"- Dropped {ticker}: below the {BASE_SCORE_MINIMUM}/55 base score minimum or outside the top {STAGE1_SHORTLIST_SIZE}")
 
     for ticker in new_set - old_set:
         s = scores[ticker]
@@ -784,7 +812,43 @@ def screen_watchlist(current_watchlist, holdings_tickers):
             f"Earnings {s['earnings']}/10, Location {s['location']}/30)"
         )
 
-    return new_watchlist, changes, indicators, scores
+    return new_watchlist, changes, indicators, scores, stage1_shortlist, stage2_eliminated
+
+
+def format_stage1_table(stage1_shortlist):
+    """The top N candidates that cleared the base score minimum (Stage 1),
+    ranked by base score, before the reward:risk check is even applied."""
+    lines = []
+    header = f"{'TICKER':8}{'BASE':>8}{'TREND':>8}{'MOM':>6}{'EARN':>6}"
+    lines.append(header)
+    lines.append("-" * len(header))
+    for c in stage1_shortlist:
+        lines.append(
+            f"{c['ticker']:8}{c['base_score']:>6}/55{c['trend']:>7}/25"
+            f"{c['momentum']:>5}/20{c['earnings']:>5}/10"
+        )
+    return "\n".join(lines) if stage1_shortlist else "(no candidates cleared the base score minimum today)"
+
+
+def format_stage2_eliminated_table(stage2_eliminated):
+    """Stage 1 survivors that got cut at Stage 2 for failing the reward:risk
+    minimum - the piece that was previously invisible."""
+    if not stage2_eliminated:
+        return "(none - every Stage 1 name also cleared the reward:risk minimum today)"
+    lines = []
+    header = f"{'TICKER':8}{'BASE':>8}{'REWARD:RISK':>14}{'REASON':>36}"
+    lines.append(header)
+    lines.append("-" * len(header))
+    for e in stage2_eliminated:
+        rr = e["reward_risk"]
+        if rr is None:
+            rr_str = "n/a"
+            reason = "no confirmed support/resistance nearby"
+        else:
+            rr_str = f"{rr:.2f}x"
+            reason = f"below the {REWARD_RISK_MINIMUM} floor"
+        lines.append(f"{e['ticker']:8}{e['base_score']:>6}/55{rr_str:>14}{reason:>36}")
+    return "\n".join(lines)
 
 
 def format_watchlist_table(watchlist, indicators, scores):
@@ -939,16 +1003,21 @@ def main():
 
     # --- Watchlist: score-based technical screen (top 15 by total score) ---
     try:
-        watchlist_us, screen_changes, indicators, scores = screen_watchlist(watchlist_us, holdings_tickers)
+        watchlist_us, screen_changes, indicators, scores, stage1_shortlist, stage2_eliminated = screen_watchlist(
+            watchlist_us, holdings_tickers
+        )
         changes_log += screen_changes
     except Exception as e:
         indicators, scores = {}, {}
+        stage1_shortlist, stage2_eliminated = [], []
         changes_log.append(f"[Watchlist screen failed: {e}]")
 
     portfolio["watchlist_us"] = watchlist_us
     save_portfolio(portfolio)  # always save: even "no changes" reflects a fresh screen run
 
     changes_text = "\n".join(changes_log) if changes_log else "(no changes today)"
+    stage1_table = format_stage1_table(stage1_shortlist)
+    stage2_table = format_stage2_eliminated_table(stage2_eliminated)
     watchlist_table = format_watchlist_table(watchlist_us, indicators, scores)
     levels_table = format_levels_table(watchlist_us, indicators)
 
@@ -978,7 +1047,17 @@ ANALYSIS
 {analysis}
 
 --------------------------------------------------
-WATCHLIST (US) - SCORED TECHNICAL SCREEN (top {WATCHLIST_MAX_US} by score, out of 85)
+STAGE 1 - PASSED BASE SCORE MINIMUM (top {STAGE1_SHORTLIST_SIZE}, ranked by Trend+Momentum+Earnings, min {BASE_SCORE_MINIMUM}/55)
+--------------------------------------------------
+{stage1_table}
+
+--------------------------------------------------
+STAGE 2 - ELIMINATED ON REWARD:RISK (from the Stage 1 shortlist above, min {REWARD_RISK_MINIMUM}x)
+--------------------------------------------------
+{stage2_table}
+
+--------------------------------------------------
+WATCHLIST (US) - FINAL SHORTLIST (top {WATCHLIST_MAX_US} by total score, out of 85)
 --------------------------------------------------
 Trend (25): price>20EMA +10, 20EMA>50EMA +10, higher highs +5
 Momentum (20): RSI 50-60 +10 / 60-65 +8 / 65-70 +5 / >70 +0; Volume vs 20-day avg: above +10 / in line with +5 / below +0
