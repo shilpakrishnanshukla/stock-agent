@@ -68,20 +68,28 @@ liquid US stocks using a **two-stage gate**, then ranked:
 **Stage 1 - base score minimum.** Trend + Momentum + Earnings (the original
 three categories, out of 55) must score **at least 45/55**. Anything below
 that is rejected immediately - it never even reaches the reward:risk check.
+Only the **top 20** by base score are kept as the Stage 1 shortlist that
+proceeds to Stage 2 (shown in full in the email, so you can see exactly
+what cleared the bar and how it scored on each of the three categories).
 
-**Stage 2 - reward:risk minimum.** Of what clears Stage 1, anything with a
-reward:risk below **2.5** is also rejected. If no confirmed support/resistance
+**Stage 2 - reward:risk minimum.** Of that Stage 1 shortlist, anything with a
+reward:risk below **2.5** is rejected. If no confirmed support/resistance
 exists at all (so reward:risk can't be computed), that also fails this stage
-- there's no way to confirm a favorable setup without a real number.
+- there's no way to confirm a favorable setup without a real number. Every
+elimination at this stage is shown in the email with its base score and its
+actual reward:risk (or "n/a" if no levels were found), so you can see exactly
+which Stage 1 names got cut here and why - this used to be invisible.
 
 **Then rank and cap.** Whatever survives both gates is ranked by total score
 out of 85 (Trend+Momentum+Earnings+Location), and the **top 15** become the
-watchlist.
+final watchlist.
 
 This means a technically strong-looking name (great trend, great RSI) still
 gets rejected if its risk/reward at current price isn't favorable, and a
 name with a great reward:risk still gets rejected if its underlying trend and
-momentum are weak. Both conditions have to hold.
+momentum are weak. Both conditions have to hold. The email now shows all
+three stages of this funnel in order: the Stage 1 shortlist, what got
+eliminated at Stage 2, and the final ranked watchlist.
 
 **Category 1 - Trend (25 pts)**
 - Price above 20-day EMA: +10
