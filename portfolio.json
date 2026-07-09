@@ -2,20 +2,12 @@
   "holdings": [],
   "watchlist_us": [
     "DHR",
-    "OXY",
-    "SHOP",
-    "AMAT",
-    "RTX",
-    "ICE",
-    "NVDA",
-    "TXN",
-    "PLTR",
-    "COP",
-    "EMR",
-    "STZ",
-    "TEAM",
-    "VLO",
-    "ADSK"
+    "SHOP"
   ],
-  "closed_positions": []
+  "closed_positions": [],
+  "trade_settings": {
+    "portfolio_value": 10000,
+    "max_risk_pct": 0.01,
+    "max_position_pct": 0.15
+  }
 }
