@@ -162,6 +162,38 @@ This is a sizing calculation based on the stop/target already derived from
 technical levels, not a recommendation of how much you personally should
 risk - adjust the percentages to whatever you're actually comfortable with.
 
+## Schedule: now 8pm SGT
+
+The workflow runs at **12:00 UTC = 8:00pm SGT**, which lands right in the US
+pre-market window (roughly 8:00am ET during daylight saving, 7:00am ET
+otherwise - both are within the 4:00am-9:30am ET pre-market session). This
+means the email you get in the Singapore evening reflects that morning's
+actual US pre-market activity, ahead of the regular session open at 9:30am ET
+(9:30pm SGT that same evening).
+
+## Pre-market gap check (shortlisted names only)
+
+For every ticker that made the final watchlist (after both gates), the email
+now includes a pre-market gap check:
+
+```
+gap_pct = (premarket_price - previous_close) / previous_close * 100
+< 1% gap:  OK - plan unchanged
+1-3% gap:  Recalculate entry/RR
+> 3% gap:  Review manually - large gap
+```
+
+For any ticker with a gap outside the "OK" band, the script makes **one
+combined web-search call** covering all of them together, asking for a
+concise 2-3 sentence reason per ticker - grounded in that morning's actual
+news, not a guess. If it can't find a clear catalyst, it says so rather than
+inventing one. Tickers with an "OK" gap don't get an explanation, since
+nothing meaningful needs explaining.
+
+If Yahoo doesn't have pre-market data for a ticker at the time the script
+runs (uncommon during the pre-market window for liquid large/mid-caps, but
+possible), that ticker shows "no pre-market data available" instead of a gap.
+
 ## Adjusting the schedule
 
 Edit the `cron` line in `.github/workflows/daily.yml`. Cron format is
