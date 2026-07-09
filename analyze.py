@@ -211,6 +211,141 @@ padding it."""
 
 
 # ---------------------------------------------------------------------------
+# Pre-market gap check (final shortlisted tickers only)
+# ---------------------------------------------------------------------------
+
+def fetch_premarket_gap(ticker):
+    """Compares the current pre-market price to yesterday's close. Returns
+    None if pre-market data isn't available (e.g. run outside the pre-market
+    window, or Yahoo hasn't got a quote for this name)."""
+    try:
+        info = yf.Ticker(ticker).info
+        previous_close = info.get("regularMarketPreviousClose") or info.get("previousClose")
+        premarket_price = info.get("preMarketPrice")
+        if previous_close is None or premarket_price is None:
+            return None
+
+        gap_pct = (premarket_price - previous_close) / previous_close * 100
+
+        if abs(gap_pct) < 1:
+            status = "OK - plan unchanged"
+        elif abs(gap_pct) <= 3:
+            status = "Recalculate entry/RR"
+        else:
+            status = "Review manually - large gap"
+
+        return {
+            "ticker": ticker,
+            "previous_close": round(previous_close, 2),
+            "premarket_price": round(premarket_price, 2),
+            "gap_pct": round(gap_pct, 2),
+            "status": status,
+        }
+    except Exception:
+        return None
+
+
+def get_gap_explanations(gaps_needing_explanation):
+    """One combined Claude call (with web search) covering every ticker with
+    a significant pre-market gap, asking for a short 2-3 sentence reason
+    each. Returns {ticker: explanation_string}."""
+    if not gaps_needing_explanation:
+        return {}
+
+    client = anthropic.Anthropic()
+
+    gap_lines = "\n".join(
+        f"- {g['ticker']}: gap {g['gap_pct']}% vs previous close "
+        f"(previous close {g['previous_close']}, pre-market {g['premarket_price']}), "
+        f"status: {g['status']}"
+        for g in gaps_needing_explanation
+    )
+
+    prompt = f"""Today's date: {datetime.now().strftime('%Y-%m-%d')}
+
+The following US stocks have a significant pre-market gap vs yesterday's
+regular-session close:
+{gap_lines}
+
+Using web search, find today's actual pre-market news or catalyst for each
+ticker and explain briefly (2-3 sentences maximum per ticker) why the price
+gapped. Be specific and factual - reference the real news if you find it
+(earnings, guidance, an analyst upgrade/downgrade, an FDA decision, M&A,
+broad macro data, etc.). If you genuinely can't find a clear reason, say so
+plainly rather than guessing or inventing one.
+
+Respond with ONLY a JSON object mapping ticker to its explanation string, no
+other text, no markdown fences:
+{{"TICKER1": "explanation...", "TICKER2": "explanation..."}}"""
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}],
+        tools=[{"type": "web_search_20250305", "name": "web_search"}],
+    )
+
+    text_parts = [block.text for block in response.content if block.type == "text"]
+    raw = "\n".join(text_parts).strip()
+
+    if "```" in raw:
+        raw = raw.split("```")[1] if raw.count("```") >= 2 else raw
+        raw = raw.replace("json", "", 1).strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1:
+        raw = raw[start:end + 1]
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def build_premarket_gaps(watchlist):
+    """Fetches pre-market gap data for the final shortlisted tickers, then
+    gets an explanation for any that gapped significantly (status other than
+    'OK'). Returns {ticker: gap_dict_or_None}, with an 'explanation' key
+    added for tickers that needed one."""
+    gaps = {}
+    needs_explanation = []
+    for ticker in watchlist:
+        gap = fetch_premarket_gap(ticker)
+        gaps[ticker] = gap
+        if gap and gap["status"] != "OK - plan unchanged":
+            needs_explanation.append(gap)
+
+    explanations = get_gap_explanations(needs_explanation)
+    for ticker, gap in gaps.items():
+        if gap:
+            gap["explanation"] = explanations.get(ticker)
+
+    return gaps
+
+
+def format_premarket_table(watchlist, gaps):
+    lines = []
+    header = f"{'TICKER':8}{'PREV CLOSE':>12}{'PREMARKET':>12}{'GAP %':>9}{'STATUS':>26}"
+    lines.append(header)
+    lines.append("-" * len(header))
+    explanation_lines = []
+    for ticker in watchlist:
+        gap = gaps.get(ticker)
+        if not gap:
+            lines.append(f"{ticker:8}  (no pre-market data available)")
+            continue
+        lines.append(
+            f"{ticker:8}{gap['previous_close']:>12.2f}{gap['premarket_price']:>12.2f}"
+            f"{gap['gap_pct']:>+8.2f}%{gap['status']:>26}"
+        )
+        if gap.get("explanation"):
+            explanation_lines.append(f"{ticker}: {gap['explanation']}")
+    table = "\n".join(lines) if watchlist else "(watchlist is empty)"
+    explanations_text = "\n\n".join(explanation_lines) if explanation_lines else "(no significant gaps today)"
+    return table, explanations_text
+
+
+# ---------------------------------------------------------------------------
 # Watchlist: rules-based technical screen
 #   Price > 20 EMA > 50 EMA, RSI(14) in [50, 60], volume vs 20d avg
 # ---------------------------------------------------------------------------
@@ -821,6 +956,9 @@ def main():
     trade_plans = build_trade_plans(watchlist_us, indicators, trade_settings)
     trade_plan_table = format_trade_plan_table(watchlist_us, trade_plans)
 
+    premarket_gaps = build_premarket_gaps(watchlist_us)
+    premarket_table, premarket_explanations = format_premarket_table(watchlist_us, premarket_gaps)
+
     overall_pl_pct = (
         round((total_value - total_cost) / total_cost * 100, 2) if total_cost else 0
     )
@@ -872,6 +1010,17 @@ Adjust these in portfolio.json under "trade_settings". Shares = the smaller of
 (risk cap / risk per share) and (position cap / entry price), rounded down.
 
 {trade_plan_table}
+
+--------------------------------------------------
+PRE-MARKET GAP CHECK (shortlisted names only)
+--------------------------------------------------
+gap % = (pre-market price - previous close) / previous close x 100
+<1% gap: OK - plan unchanged | 1-3%: Recalculate entry/RR | >3%: Review manually - large gap
+
+{premarket_table}
+
+Why the significant gaps happened:
+{premarket_explanations}
 
 --------------------------------------------------
 This is an automated research note, not financial advice. Data may be delayed
