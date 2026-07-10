@@ -8,5 +8,6 @@
     "portfolio_value": 10000,
     "max_risk_pct": 0.01,
     "max_position_pct": 0.15
-  }
+  },
+  "watchlist_sg": []
 }
