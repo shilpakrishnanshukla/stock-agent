@@ -170,6 +170,39 @@ This is a sizing calculation based on the stop/target already derived from
 technical levels, not a recommendation of how much you personally should
 risk - adjust the percentages to whatever you're actually comfortable with.
 
+## SG (SGX) watchlist - separate daily email at 8:30am SGT
+
+A second script, `analyze_sg.py`, runs the exact same scoring engine
+(Trend/Momentum/Earnings/Location, the two-stage gate, pivot-based
+support/resistance, and position sizing) against a curated universe of
+30 liquid SGX names (the current STI constituents), and emails a separate
+note at **8:30am SGT** - just ahead of SGX's 9:00am open.
+
+It shares `portfolio.json` with the US script: your holdings and
+`trade_settings` are common to both, while `watchlist_sg` is tracked and
+auto-curated separately from `watchlist_us`. It's capped at the top 10
+(smaller than the US list's 15, since SGX has far less liquid breadth to
+draw from) with a top-15 Stage 1 shortlist (vs the US script's top 20).
+
+Deploy it the same way as the US script - upload `analyze_sg.py` and
+`.github/workflows/daily_sg.yml` to your repo alongside the existing files.
+It uses the same 4 secrets you've already set up (`ANTHROPIC_API_KEY`,
+`EMAIL_ADDRESS`, `EMAIL_APP_PASSWORD`, `TO_EMAIL`) - no new secrets needed.
+
+One deliberate omission: **this email does not include a pre-market gap
+section.** Yahoo Finance's `preMarketPrice` field is a US-market concept and
+doesn't reliably populate for `.SI` tickers, so faking that section would
+give you misleading "no data" noise rather than something useful. If you
+later want an SGX pre-open equivalent, that would need a different data
+source than Yahoo Finance.
+
+Also worth knowing: Yahoo's earnings-calendar coverage is noticeably less
+complete for SGX names than US names. Since a missing earnings date scores
+favorably by design (+10, "no near-term risk visible"), that means the
+Earnings category leans a bit more optimistic-by-default for SG names -
+worth treating with slightly more skepticism than the same score on a US
+ticker.
+
 ## Schedule: now 8pm SGT
 
 The workflow runs at **12:00 UTC = 8:00pm SGT**, which lands right in the US
