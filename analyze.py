@@ -82,6 +82,7 @@ def load_portfolio():
     if "watchlist" in portfolio and "watchlist_us" not in portfolio:
         portfolio["watchlist_us"] = portfolio.pop("watchlist")
     portfolio.setdefault("watchlist_us", [])
+    portfolio.setdefault("watchlist_sg", [])
     portfolio.setdefault("holdings", [])
     portfolio.setdefault("closed_positions", [])
     settings = portfolio.setdefault("trade_settings", {})
@@ -709,23 +710,33 @@ REWARD_RISK_MINIMUM = 2.5
 STAGE1_SHORTLIST_SIZE = 20
 
 
-def screen_watchlist(current_watchlist, holdings_tickers):
+def screen_watchlist(current_watchlist, holdings_tickers, universe_list=None, max_size=None, stage1_size=None):
     """Two-stage gate, then rank:
       Stage 1: reject anything scoring below BASE_SCORE_MINIMUM out of 55 on
                Trend + Momentum + Earnings alone (the original three
                categories, before Location/reward:risk is even considered).
-               The top STAGE1_SHORTLIST_SIZE survivors (by base score) are
-               kept as the Stage 1 shortlist shown in the email.
+               The top `stage1_size` survivors (by base score) are kept as
+               the Stage 1 shortlist shown in the email.
       Stage 2: of that Stage 1 shortlist, reject anything with reward:risk
                below REWARD_RISK_MINIMUM.
       Then rank Stage 2 survivors by total score (out of 85, Location
-      included) and take the top WATCHLIST_MAX_US as the final watchlist.
+      included) and take the top `max_size` as the final watchlist.
+
+    `universe_list`, `max_size`, and `stage1_size` default to the US settings
+    (US_CANDIDATE_UNIVERSE, WATCHLIST_MAX_US, STAGE1_SHORTLIST_SIZE) so
+    existing callers don't need to change; pass different values to run this
+    same screen against a different market/universe (e.g. SGX).
+
     Returns (new_watchlist, changes_log, indicators_by_ticker, scores_by_ticker,
     stage1_shortlist, stage2_eliminated) where:
-      stage1_shortlist = list of dicts for the top 20 that cleared Stage 1
+      stage1_shortlist = list of dicts for the top `stage1_size` that cleared Stage 1
       stage2_eliminated = list of dicts for Stage 1 survivors cut at Stage 2
     """
-    universe = sorted(set(US_CANDIDATE_UNIVERSE) | set(current_watchlist))
+    universe_list = universe_list if universe_list is not None else US_CANDIDATE_UNIVERSE
+    max_size = max_size if max_size is not None else WATCHLIST_MAX_US
+    stage1_size = stage1_size if stage1_size is not None else STAGE1_SHORTLIST_SIZE
+
+    universe = sorted(set(universe_list) | set(current_watchlist))
     universe = [t for t in universe if t not in holdings_tickers]
 
     indicators = compute_technical_indicators(universe)
@@ -759,7 +770,7 @@ def screen_watchlist(current_watchlist, holdings_tickers):
     # actually proceeds to the reward:risk check - matches "show me the
     # first 20 it shortlisted" rather than every single Stage 1 passer.
     stage1_candidates.sort(key=lambda c: c["base_score"], reverse=True)
-    stage1_shortlist = stage1_candidates[:STAGE1_SHORTLIST_SIZE]
+    stage1_shortlist = stage1_candidates[:stage1_size]
 
     scores = {}
     stage2_eliminated = []
@@ -781,7 +792,7 @@ def screen_watchlist(current_watchlist, holdings_tickers):
         scores[ticker] = score_ticker(ind, candidate["earnings_days"])
 
     ranked = sorted(scores.items(), key=lambda kv: kv[1]["total"], reverse=True)
-    new_watchlist = [ticker for ticker, _ in ranked[:WATCHLIST_MAX_US]]
+    new_watchlist = [ticker for ticker, _ in ranked[:max_size]]
 
     # Simple day-over-day diff, same as before, for the "changes today" log.
     rejected_base_lookup = {
@@ -800,9 +811,9 @@ def screen_watchlist(current_watchlist, holdings_tickers):
         else:
             s = scores.get(ticker)
             if s:
-                changes.append(f"- Dropped {ticker}: score {s['total']}/85, no longer in the top {WATCHLIST_MAX_US}")
+                changes.append(f"- Dropped {ticker}: score {s['total']}/85, no longer in the top {max_size}")
             else:
-                changes.append(f"- Dropped {ticker}: below the {BASE_SCORE_MINIMUM}/55 base score minimum or outside the top {STAGE1_SHORTLIST_SIZE}")
+                changes.append(f"- Dropped {ticker}: below the {BASE_SCORE_MINIMUM}/55 base score minimum or outside the top {stage1_size}")
 
     for ticker in new_set - old_set:
         s = scores[ticker]
