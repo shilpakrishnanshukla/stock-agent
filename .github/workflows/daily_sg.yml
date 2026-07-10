@@ -1,0 +1,43 @@
+name: Daily SG Watchlist
+
+on:
+  schedule:
+    # 00:30 UTC = 8:30am SGT, Mon-Fri (SGX opens 9:00am SGT, no DST in Singapore)
+    - cron: "30 0 * * 1-5"
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab too
+
+permissions:
+  contents: write
+
+jobs:
+  analyze_sg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run SG watchlist analysis and send email
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: python analyze_sg.py
+
+      - name: Commit updated SG watchlist
+        run: |
+          git config user.name "stock-agent-bot"
+          git config user.email "actions@github.com"
+          git add portfolio.json
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-update SG watchlist $(date +%Y-%m-%d)"
+            git push
+          else
+            echo "No SG watchlist changes to commit."
+          fi
