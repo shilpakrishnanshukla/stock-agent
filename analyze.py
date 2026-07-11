@@ -1764,6 +1764,14 @@ def build_atr_trade_plans(watchlist, trade_settings, indicators=None, scores=Non
                 tickers=ticker, period="15mo", interval="1d",
                 progress=False, auto_adjust=False,
             )
+            # yfinance sometimes returns MultiIndex columns even for a
+            # single ticker - same defensive unwrap as
+            # compute_technical_indicators, just never applied here before.
+            if isinstance(df.columns, pd.MultiIndex):
+                if ticker in df.columns.get_level_values(-1):
+                    df = df.xs(ticker, axis=1, level=-1)
+                elif ticker in df.columns.get_level_values(0):
+                    df = df[ticker]
             df = df.dropna(subset=["Close", "High", "Low", "Volume"])
             if df is None or len(df) < 30:
                 plans[ticker] = {
