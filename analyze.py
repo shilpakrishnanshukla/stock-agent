@@ -42,9 +42,14 @@ import pandas as pd
 import numpy as np
 import anthropic
 
+from gdrive_sync import download_workbook, upload_workbook
+from trade_planner_writer import update_trade_planner
+
 PORTFOLIO_FILE = "portfolio.json"
 MODEL = "claude-sonnet-4-6"
 WATCHLIST_MAX_US = 15
+TRADE_PLANNER_LOCAL = "trade_planner_temp.xlsx"
+TRADE_PLANNER_MARKET = "US"
 
 # A broad, liquid US candidate universe to screen daily for the watchlist.
 # Not an exhaustive S&P 500 list, but a representative, liquid cross-section
@@ -1225,10 +1230,18 @@ def compute_technical_indicators(tickers):
         try:
             if data is None:
                 raise ValueError("batch download failed")
-            if len(tickers) == 1:
-                df = data
+            # Don't assume shape from len(tickers) - check the actual columns
+            # returned. A MultiIndex means this ticker's data is one slice of
+            # a multi-ticker frame; flat columns mean it's already isolated.
+            if isinstance(data.columns, pd.MultiIndex):
+                if ticker in data.columns.get_level_values(0):
+                    df = data[ticker]
+                elif ticker in data.columns.get_level_values(-1):
+                    df = data.xs(ticker, axis=1, level=-1)
+                else:
+                    raise ValueError(f"{ticker} not found in downloaded data")
             else:
-                df = data[ticker]
+                df = data
             df = df.dropna(subset=["Close", "High", "Low", "Volume"])
             if df is None or len(df) < 55:
                 results[ticker] = None
@@ -1742,7 +1755,7 @@ def build_atr_trade_plans(watchlist, trade_settings, indicators=None, scores=Non
     for ticker in watchlist:
         try:
             df = yf.download(
-                tickers=[ticker], period="15mo", interval="1d",
+                tickers=ticker, period="15mo", interval="1d",
                 progress=False, auto_adjust=False,
             )
             df = df.dropna(subset=["Close", "High", "Low", "Volume"])
@@ -1870,6 +1883,86 @@ def format_exit_plan_section(watchlist, atr_plans):
     return "\n\n".join(blocks)
 
 
+# ---------------------------------------------------------------------------
+# Trade Planner (Google Drive) sync
+# ---------------------------------------------------------------------------
+
+def infer_setup_type(ind):
+    """Rough, best-effort label for the Trade Planner's 'Setup Type' column,
+    derived from data the screen already computes. Not a rigorous
+    classification - feel free to hand-edit this column after the fact;
+    the writer never overwrites a row it didn't just create."""
+    if not ind:
+        return "Screen Candidate"
+    if ind.get("higher_highs") and ind.get("higher_lows"):
+        return "Trend Continuation"
+    price = ind.get("price")
+    support = ind.get("nearest_support")
+    if price is not None and support is not None and price <= support * 1.03:
+        return "Pullback to Support"
+    return "Momentum"
+
+
+def build_trade_planner_candidates(watchlist, indicators, scores, trade_plans, atr_trade_plans):
+    """Converts today's final watchlist into the dict shape
+    trade_planner_writer.update_trade_planner() expects. Company name isn't
+    available anywhere in this pipeline (only tickers), so it's left equal
+    to the ticker - fill it in by hand in the sheet, or tell me and I'll
+    add a ticker->company lookup table."""
+    candidates = []
+    for ticker in watchlist:
+        ind = indicators.get(ticker) or {}
+        s = scores.get(ticker) or {}
+        fixed_plan = trade_plans.get(ticker) or {}
+        atr_plan = atr_trade_plans.get(ticker) or {}
+        rr = ind.get("reward_risk") or {}
+
+        entry = fixed_plan.get("entry") or atr_plan.get("entry") or ind.get("price")
+        stop = atr_plan.get("stop_loss") or fixed_plan.get("stop_loss") or rr.get("stop")
+        target = fixed_plan.get("target_sell") or rr.get("target")
+
+        exec_status = get_execution_status(ticker, trade_plans, atr_trade_plans)
+        status = "Pass" if exec_status == "Ready" else "Watch"
+
+        candidates.append({
+            "ticker": ticker,
+            "company": ticker,
+            "market": TRADE_PLANNER_MARKET,
+            "setup_type": infer_setup_type(ind),
+            "trend_score": s.get("trend"),
+            "momentum_score": s.get("momentum"),
+            "earnings_score": s.get("earnings"),
+            "location_score": s.get("location"),
+            "entry": entry,
+            "support": ind.get("nearest_support"),
+            "atr": atr_plan.get("atr"),
+            "stop": stop,
+            "resistance": ind.get("nearest_resistance"),
+            "target": target,
+            "status": status,
+            "notes": f"Auto-added by daily pipeline - {datetime.now().strftime('%Y-%m-%d')} - Execution: {exec_status}",
+        })
+    return candidates
+
+
+def sync_trade_planner(watchlist, indicators, scores, trade_plans, atr_trade_plans):
+    """Downloads the Trade Planner workbook from Drive, appends any new
+    candidates below the last used row (never touching rows you've already
+    annotated), and re-uploads only if something was actually added.
+    Returns a clean, human-readable status string for the email; raises
+    nothing - callers should still wrap this in try/except for the
+    Data-Quality Alerts section, since Drive/network calls can fail."""
+    candidates = build_trade_planner_candidates(watchlist, indicators, scores, trade_plans, atr_trade_plans)
+    if not candidates:
+        return "No candidates today - Trade Planner not touched."
+    download_workbook(TRADE_PLANNER_LOCAL)
+    added = update_trade_planner(TRADE_PLANNER_LOCAL, candidates)
+    if added:
+        upload_workbook(TRADE_PLANNER_LOCAL)
+        return f"{added} new row(s) added to Trade Planner."
+    return "All of today's candidates were already in Trade Planner - nothing added."
+
+
 def send_email(subject, body):
     msg = MIMEText(body)
     msg["Subject"] = subject
@@ -1947,6 +2040,16 @@ def main():
     data_quality_alerts += atr_alerts
     exit_plan_section = format_exit_plan_section(watchlist_us, atr_trade_plans)
     atr_trade_plan_table = format_atr_trade_plan_table(watchlist_us, atr_trade_plans)
+
+    # --- Trade Planner (Google Drive) sync: append-only, never blocks the email ---
+    try:
+        trade_planner_status = sync_trade_planner(
+            watchlist_us, indicators, scores, trade_plans, atr_trade_plans
+        )
+    except Exception as e:
+        clean = humanize_exception("Trade Planner sync", e)
+        trade_planner_status = f"Sync failed - {clean}"
+        data_quality_alerts.append(f"Trade Planner sync failed - {clean}")
 
     if weekend:
         premarket_section = "Not applicable - weekend, US market closed."
@@ -2053,6 +2156,9 @@ Qualification: base score >= {BASE_SCORE_MINIMUM}/55 and reward:risk >= {REWARD_
 
 --- Support / resistance detail ---
 {levels_table}
+
+--- Trade Planner (Google Sheet/Excel) sync ---
+{trade_planner_status}
 
 ====================================================
 4. REJECTED / WATCH NAMES
