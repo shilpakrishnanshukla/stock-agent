@@ -109,6 +109,10 @@ def main():
     trade_plans = analyze.build_trade_plans(watchlist_sg, indicators, trade_settings)
     trade_plan_table = analyze.format_trade_plan_table(watchlist_sg, trade_plans)
 
+    atr_trade_plans = analyze.build_atr_trade_plans(watchlist_sg, trade_settings, indicators, scores)
+    exit_plan_section = analyze.format_exit_plan_section(watchlist_sg, atr_trade_plans)
+    atr_trade_plan_table = analyze.format_atr_trade_plan_table(watchlist_sg, atr_trade_plans)
+
     body = f"""DAILY SG (SGX) WATCHLIST - {datetime.now().strftime('%A, %B %d, %Y')}
 
 Universe: {len(SG_CANDIDATE_UNIVERSE)} liquid SGX names (current STI constituents).
@@ -159,6 +163,32 @@ watchlist). Shares = the smaller of (risk cap / risk per share) and
 (position cap / entry price), rounded down.
 
 {trade_plan_table}
+
+--------------------------------------------------
+ATR-BASED TRADE PLAN (volatility-adjusted stop, alternative to the fixed-buffer plan above)
+--------------------------------------------------
+Entry = latest close. Stop = nearest pivot support minus 0.75x ATR(14) (instead
+of a fixed 0.5% buffer). Target = nearest pivot resistance.
+Status: CANDIDATE = R:R >= 3 and passes sizing | WATCH = R:R 2.5-3 | PASS = R:R < 2.5,
+position rounds to 0 shares, or no usable support/resistance was found.
+
+{atr_trade_plan_table}
+
+--------------------------------------------------
+EXIT PLAN - MULTI-TARGET SCALE-OUT (per shortlisted ticker)
+--------------------------------------------------
+For each ticker with a valid ATR trade plan: up to three exit targets from
+independent sources (a volatility-based ATR extension, the nearest chart
+resistance, and a longer-term "major" resistance for a partial runner
+position), each scored 0-100 on reward:risk, structure alignment, RSI,
+volume, and earnings timing. Near-duplicate targets are merged, keeping the
+higher-scored one. The PRIMARY TARGET is the highest-scored candidate among
+those clearing a 2.5 reward:risk floor - if none clear it, no primary target
+is shown (status: NO_TARGET_MEETS_MINIMUM_RR) rather than falling back to a
+weaker one. Shares are split 30% / 40% / runner across target 1, target 2,
+and whatever's left (70% / runner if only one target exists).
+
+{exit_plan_section}
 
 --------------------------------------------------
 This is an automated research note, not financial advice. Data may be delayed
