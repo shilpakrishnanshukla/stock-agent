@@ -60,6 +60,73 @@ fine for this, no need for git on your machine):
 - **Sell**: remove it from `holdings` and add it to `closed_positions` with
   `sold_price` and `date_sold`, so you keep a record.
 
+## The daily report is now decision-first
+
+The email used to lead with tables. It now leads with a plain-English
+decision summary, and moves all the noisy detail either into a compact
+form or into the console/GitHub Actions log (never both the full detail
+and a summary in the email body).
+
+**Six sections, in order:**
+
+1. **Decision summary** - one paragraph, the single most important message
+   first: how many holdings, how many need action, how many candidates
+   passed, the strongest one, market open/closed status, and whether any
+   data-quality issues exist. Example: *"No current holdings. One candidate
+   passed: CRWD. Fixed-buffer reward:risk 3.29x, but execution is on hold
+   (price-history columns missing from the data feed) - do not place a
+   trade from the automated recommendation until that's resolved."*
+2. **Portfolio actions** - `Current holdings: N`, `Portfolio actions
+   required: N` (a real count, derived from a structured HOLD/TRIM/SELL/ADD
+   verdict Claude returns alongside its written analysis - not a guess),
+   then the holdings table and written analysis. Says "Current holdings:
+   None" plainly when empty, not a paragraph of prose.
+3. **New trade candidates** - the qualification bar stated in one line
+   (`Base score >= 45/55 and reward:risk >= 2.5x`, full methodology lives
+   in this README, not repeated daily), then each candidate's **two
+   separate statuses**:
+   - **Setup status**: `Qualified` - it passed both gates, this doesn't change
+   - **Execution status**: `Ready`, or `Hold - <specific reason>` if the
+     ATR or fixed-buffer sizing plan couldn't be completed
+   A candidate that qualifies but has incomplete sizing data is never
+   silently labeled just "candidate" - the report is explicit that setup
+   quality and execution readiness are different things.
+4. **Rejected / watch names** - counts only (`Stage 1 passed: 20`,
+   `Rejected on reward:risk: 19`, `Final candidates: 1`), plus the
+   **5 closest rejects** by reward:risk so you can see what almost made it.
+   The full Stage 1/Stage 2 detail still exists - it's printed to the
+   console/GitHub Actions log on every run, just not in the email.
+5. **Market and pre-market validation** - the pre-market gap check on
+   weekdays; on weekends, this correctly says "Not applicable - weekend,
+   US market closed" instead of showing an empty or misleading table.
+6. **Data-quality alerts** - a clean, human-readable list of anything that
+   failed (e.g. *"CRWD: ATR plan unavailable - not enough price history."*).
+   Raw Python exceptions are never shown here - they're only ever printed
+   to the console/log for debugging, never emailed.
+
+**Weekend handling**: if the report runs on a Saturday or Sunday, it
+labels itself **"WEEKEND STRATEGY REVIEW"** instead of "DAILY PRE-MARKET
+NOTE", states plainly which prior weekday's close the figures reflect, and
+marks pre-market data as not applicable rather than showing a confusing or
+empty section.
+
+**Data freshness header**: every email opens with `Generated:` (timestamp),
+`Price data through:` (which close the figures reflect), and `Premarket
+data:` (applicable or not) - so there's never ambiguity between live,
+overnight, and stale figures.
+
+**Terminology, standardized throughout**: stop-loss (not "stop"/"SL"),
+take-profit target (not target/upper limit/resistance/max profit mixed),
+reward:risk (spelled out, not alternating with "R:R" as if they were
+different things), and position value (not invest/investment
+interchangeably). The watchlist table's pivot columns are labeled
+`LAST PIV HI`/`LAST PIV LO` (the most recent confirmed swing pivot, used
+for the higher-highs trend check) so they're never confused with the
+separate `NEAREST SUPP`/`NEAREST RESIST` columns in the support/resistance
+table, or the exit plan's distinct "nearest resistance" vs. "major
+resistance" - three related but different numbers that used to look like
+they might be duplicates of each other.
+
 ## The watchlist is now a weighted scoring system (US only)
 
 The SG watchlist stays paused. The US watchlist is screened daily across ~150
