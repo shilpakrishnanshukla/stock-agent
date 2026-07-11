@@ -81,6 +81,8 @@ def main():
     holdings = portfolio.get("holdings", [])
     watchlist_sg = portfolio.get("watchlist_sg", [])
     holdings_tickers = [h["ticker"] for h in holdings]
+    weekend = analyze.is_weekend()
+    data_quality_alerts = []
 
     try:
         watchlist_sg, screen_changes, indicators, scores, stage1_shortlist, stage2_eliminated = (
@@ -93,15 +95,24 @@ def main():
             )
         )
     except Exception as e:
-        watchlist_sg, screen_changes = [], [f"[SG watchlist screen failed: {e}]"]
+        clean = analyze.humanize_exception("SG watchlist screen", e)
+        watchlist_sg, screen_changes = [], [f"- SG watchlist screen failed: {clean}"]
         indicators, scores, stage1_shortlist, stage2_eliminated = {}, {}, [], []
+        data_quality_alerts.append(f"SG watchlist screen failed - {clean}")
 
     portfolio["watchlist_sg"] = watchlist_sg
     analyze.save_portfolio(portfolio)
 
     changes_text = "\n".join(screen_changes) if screen_changes else "(no changes today)"
-    stage1_table = analyze.format_stage1_table(stage1_shortlist)
-    stage2_table = analyze.format_stage2_eliminated_table(stage2_eliminated)
+
+    print("=" * 70)
+    print(f"FULL STAGE 1 SHORTLIST ({len(stage1_shortlist)}) - log only, not in email")
+    print(analyze.format_stage1_table(stage1_shortlist))
+    print()
+    print(f"FULL STAGE 2 ELIMINATIONS ({len(stage2_eliminated)}) - log only, not in email")
+    print(analyze.format_stage2_eliminated_table(stage2_eliminated))
+    print("=" * 70)
+
     watchlist_table = analyze.format_watchlist_table(watchlist_sg, indicators, scores)
     levels_table = analyze.format_levels_table(watchlist_sg, indicators)
 
@@ -109,86 +120,99 @@ def main():
     trade_plans = analyze.build_trade_plans(watchlist_sg, indicators, trade_settings)
     trade_plan_table = analyze.format_trade_plan_table(watchlist_sg, trade_plans)
 
-    atr_trade_plans = analyze.build_atr_trade_plans(watchlist_sg, trade_settings, indicators, scores)
+    atr_trade_plans, atr_alerts = analyze.build_atr_trade_plans(watchlist_sg, trade_settings, indicators, scores)
+    data_quality_alerts += atr_alerts
     exit_plan_section = analyze.format_exit_plan_section(watchlist_sg, atr_trade_plans)
     atr_trade_plan_table = analyze.format_atr_trade_plan_table(watchlist_sg, atr_trade_plans)
 
-    body = f"""DAILY SG (SGX) WATCHLIST - {datetime.now().strftime('%A, %B %d, %Y')}
+    decision_summary = analyze.build_decision_summary(
+        holdings=[], portfolio_action_count=0, watchlist=watchlist_sg, scores=scores,
+        trade_plans=trade_plans, atr_trade_plans=atr_trade_plans, weekend=weekend,
+        data_quality_count=len(data_quality_alerts),
+    )
+    # This script never reports on holdings (see the note in the email below),
+    # so the leading "No current holdings" clause from the shared summary
+    # builder doesn't apply here - drop it rather than show a misleading line.
+    decision_summary = decision_summary.replace("No current holdings. ", "")
 
+    rejects = analyze.closest_rejects(stage2_eliminated, n=5)
+    if rejects:
+        rejects_lines = "\n".join(
+            f"  {r['ticker']}: {r['reward_risk']}x" if r["reward_risk"] is not None else f"  {r['ticker']}: n/a"
+            for r in rejects
+        )
+    else:
+        rejects_lines = "  (none)"
+
+    data_quality_text = "\n".join(f"- {a}" for a in data_quality_alerts) if data_quality_alerts else "None."
+
+    report_label = "WEEKEND SG STRATEGY REVIEW" if weekend else "DAILY SG PRE-MARKET NOTE"
+    if weekend:
+        price_data_line = f"Price data through: {analyze.last_trading_day_label()} SGX close"
+    else:
+        price_data_line = f"Price data through: {datetime.now().strftime('%d %b %Y')} (most recent available)"
+
+    candidate_lines = []
+    for ticker in sorted(watchlist_sg, key=lambda t: scores.get(t, {}).get("total", 0), reverse=True):
+        s = scores.get(ticker, {})
+        fixed_plan = trade_plans.get(ticker)
+        exec_status = analyze.get_execution_status(ticker, trade_plans, atr_trade_plans)
+        rr = fixed_plan["reward_risk"] if fixed_plan else "n/a"
+        candidate_lines.append(
+            f"{ticker}: score {s.get('total', 'n/a')}/85 | Setup status: Qualified | "
+            f"Execution status: {exec_status} | Fixed-buffer reward:risk: {rr}x"
+        )
+    candidates_summary = "\n".join(candidate_lines) if candidate_lines else "(none)"
+
+    body = f"""{report_label} - {datetime.now().strftime('%A, %d %B %Y')}
+
+Generated: {datetime.now().strftime('%d %b %Y, %H:%M')} (server time)
+{price_data_line}
 Universe: {len(SG_CANDIDATE_UNIVERSE)} liquid SGX names (current STI constituents).
 This note covers the watchlist only - for SG holdings P&L, see the evening
 US/portfolio email, which covers all holdings regardless of market.
 
---------------------------------------------------
-STAGE 1 - PASSED BASE SCORE MINIMUM (top {STAGE1_SHORTLIST_SIZE_SG}, ranked by Trend+Momentum+Earnings, min {analyze.BASE_SCORE_MINIMUM}/55)
---------------------------------------------------
-{stage1_table}
+====================================================
+1. DECISION SUMMARY
+====================================================
+{decision_summary}
 
---------------------------------------------------
-STAGE 2 - ELIMINATED ON REWARD:RISK (from the Stage 1 shortlist above, min {analyze.REWARD_RISK_MINIMUM}x)
---------------------------------------------------
-{stage2_table}
+====================================================
+2. NEW TRADE CANDIDATES
+====================================================
+Qualification: base score >= {analyze.BASE_SCORE_MINIMUM}/55 and reward:risk >= {analyze.REWARD_RISK_MINIMUM}x. Full methodology in the repo README.
 
---------------------------------------------------
-WATCHLIST (SG) - FINAL SHORTLIST (top {WATCHLIST_MAX_SG} by total score, out of 85)
---------------------------------------------------
-Trend (25): price>20EMA +10, 20EMA>50EMA +10, higher highs +5
-Momentum (20): RSI 50-60 +10 / 60-65 +8 / 65-70 +5 / >70 +0; Volume vs 20-day avg: above +10 / in line with +5 / below +0
-Earnings (10): earnings within 5 trading days +0, within 6-10 +5, else +10
-Location (30): near support (<=3% +15 / <=6% +10 / <=10% +5), room below resistance (>=8% +5 / >=5% +3), reward:risk (>=4 +10 / >=3 +8 / >=2.5 +5)
-Two-stage gate: Stage 1 rejects anything below 45/55 on Trend+Momentum+Earnings alone. Stage 2 (of what's left) rejects reward:risk below 2.5. Survivors are ranked by total score out of 85 (Location included).
+{candidates_summary}
 
-{watchlist_table}
-
-CHANGES TODAY
-{changes_text}
-
---------------------------------------------------
-SUPPORT / RESISTANCE & REWARD:RISK (sorted best R:R first)
---------------------------------------------------
-Support/resistance = nearest confirmed pivot low/high in the last 60 sessions.
-Stop = support minus a 0.5% buffer. Target = nearest resistance. R:R = reward / risk.
-"n/a" means no confirmed pivot was found on that side within the lookback window.
-
-{levels_table}
-
---------------------------------------------------
-TRADE PLAN (position sizing on shortlisted names)
---------------------------------------------------
-Assumes portfolio value ${trade_settings['portfolio_value']:,.0f}, max risk per trade
-{trade_settings['max_risk_pct']*100:.1f}% (${trade_settings['portfolio_value']*trade_settings['max_risk_pct']:,.2f}),
-max position size {trade_settings['max_position_pct']*100:.1f}% (${trade_settings['portfolio_value']*trade_settings['max_position_pct']:,.2f}).
-Adjust these in portfolio.json under "trade_settings" (shared with the US
-watchlist). Shares = the smaller of (risk cap / risk per share) and
-(position cap / entry price), rounded down.
-
+--- Fixed-buffer sizing ---
 {trade_plan_table}
 
---------------------------------------------------
-ATR-BASED TRADE PLAN (volatility-adjusted stop, alternative to the fixed-buffer plan above)
---------------------------------------------------
-Entry = latest close. Stop = nearest pivot support minus 0.75x ATR(14) (instead
-of a fixed 0.5% buffer). Target = nearest pivot resistance.
-Status: CANDIDATE = R:R >= 3 and passes sizing | WATCH = R:R 2.5-3 | PASS = R:R < 2.5,
-position rounds to 0 shares, or no usable support/resistance was found.
-
+--- ATR-based sizing (volatility-adjusted stop-loss) ---
 {atr_trade_plan_table}
 
---------------------------------------------------
-EXIT PLAN - MULTI-TARGET SCALE-OUT (per shortlisted ticker)
---------------------------------------------------
-For each ticker with a valid ATR trade plan: up to three exit targets from
-independent sources (a volatility-based ATR extension, the nearest chart
-resistance, and a longer-term "major" resistance for a partial runner
-position), each scored 0-100 on reward:risk, structure alignment, RSI,
-volume, and earnings timing. Near-duplicate targets are merged, keeping the
-higher-scored one. The PRIMARY TARGET is the highest-scored candidate among
-those clearing a 2.5 reward:risk floor - if none clear it, no primary target
-is shown (status: NO_TARGET_MEETS_MINIMUM_RR) rather than falling back to a
-weaker one. Shares are split 30% / 40% / runner across target 1, target 2,
-and whatever's left (70% / runner if only one target exists).
-
+--- Exit plan (multi-target scale-out) ---
 {exit_plan_section}
+
+--- Support / resistance detail ---
+{levels_table}
+
+====================================================
+3. REJECTED / WATCH NAMES
+====================================================
+Stage 1 passed: {len(stage1_shortlist)}
+Rejected on reward:risk: {len(stage2_eliminated)}
+Final candidates: {len(watchlist_sg)}
+
+Closest reward:risk rejects:
+{rejects_lines}
+
+Changes today:
+{changes_text}
+
+====================================================
+4. DATA-QUALITY ALERTS
+====================================================
+{data_quality_text}
 
 --------------------------------------------------
 This is an automated research note, not financial advice. Data may be delayed
@@ -201,7 +225,7 @@ found - treat that category with a bit more caution for SG names.
     print(body)
 
     if os.environ.get("EMAIL_ADDRESS"):
-        analyze.send_email(f"Daily SG Watchlist - {datetime.now().strftime('%Y-%m-%d')}", body)
+        analyze.send_email(f"{report_label.title()} - {datetime.now().strftime('%Y-%m-%d')}", body)
         print("\nEmail sent.")
     else:
         print("\nEMAIL_ADDRESS not set - skipped sending email.")
