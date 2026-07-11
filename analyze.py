@@ -32,6 +32,8 @@ import math
 import os
 import smtplib
 import sys
+from dataclasses import dataclass, asdict
+from typing import Any, Optional
 from datetime import datetime
 from email.mime.text import MIMEText
 
@@ -362,19 +364,34 @@ def compute_rsi(close_series, period=14):
     return rsi
 
 
-def add_pivots(df, left=2, right=2):
-    """Marks pivot highs/lows: a bar whose High (Low) is the max (min) within
-    a window of `left` bars before and `right` bars after it. Standard swing
-    high/low definition used for reading market structure."""
-    df = df.copy()
-    df["pivot_high"] = False
-    df["pivot_low"] = False
-    for i in range(left, len(df) - right):
-        high_window = df["High"].iloc[i - left:i + right + 1]
-        low_window = df["Low"].iloc[i - left:i + right + 1]
-        df.loc[df.index[i], "pivot_high"] = df["High"].iloc[i] == high_window.max()
-        df.loc[df.index[i], "pivot_low"] = df["Low"].iloc[i] == low_window.min()
-    return df
+def add_pivots(df: pd.DataFrame, left: int = 2, right: int = 2) -> pd.DataFrame:
+    """
+    Add pivot_high and pivot_low Boolean columns.
+
+    A pivot high must be the highest point within the surrounding window.
+    A pivot low must be the lowest point within the surrounding window.
+    """
+    required = {"High", "Low"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    result = df.copy()
+    result["pivot_high"] = False
+    result["pivot_low"] = False
+
+    highs = result["High"].to_numpy(dtype=float)
+    lows = result["Low"].to_numpy(dtype=float)
+    pivot_high_col = result.columns.get_loc("pivot_high")
+    pivot_low_col = result.columns.get_loc("pivot_low")
+
+    for i in range(left, len(result) - right):
+        high_window = highs[i - left:i + right + 1]
+        low_window = lows[i - left:i + right + 1]
+        result.iloc[i, pivot_high_col] = highs[i] == np.max(high_window)
+        result.iloc[i, pivot_low_col] = lows[i] == np.min(low_window)
+
+    return result
 
 
 def get_pivot_structure_from_pivots(pivots_df):
@@ -416,6 +433,13 @@ def nearest_levels(pivots_df, current_price, lookback_days=60):
     nearest_support = float(supports["price"].max()) if not supports.empty else None
     nearest_resistance = float(resistances["price"].min()) if not resistances.empty else None
     return nearest_support, nearest_resistance
+
+
+def find_nearest_pivot_levels(pivots_df, current_price, lookback_bars=60):
+    """Same as nearest_levels, under the name/parameter used by
+    build_atr_trade_plan (lookback measured in bars rather than days -
+    equivalent here since we're on daily bars)."""
+    return nearest_levels(pivots_df, current_price, lookback_days=lookback_bars)
 
 
 def reward_risk(entry, support, resistance, buffer_pct=0.005):
@@ -481,6 +505,571 @@ def calculate_trade_plan(
         "position_limit": round(max_position_dollars, 2),
         "risk_limit": round(max_risk_dollars, 2),
     }
+
+
+def add_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """
+    Add Wilder-style ATR.
+
+    Required columns:
+        High, Low, Close
+    """
+    required = {"High", "Low", "Close"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    result = df.copy()
+    previous_close = result["Close"].shift(1)
+
+    true_range = pd.concat(
+        [
+            result["High"] - result["Low"],
+            (result["High"] - previous_close).abs(),
+            (result["Low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    result["TR"] = true_range
+    result[f"ATR_{period}"] = true_range.ewm(
+        alpha=1 / period, adjust=False, min_periods=period,
+    ).mean()
+
+    return result
+
+
+def calculate_atr_stop(support, atr, zone_atr_fraction=0.25, stop_buffer_atr=0.75):
+    """Places the stop a volatility-adjusted distance below support, instead
+    of a fixed percentage buffer. `stop_buffer_atr` controls how many ATRs
+    below support the stop sits; `zone_atr_fraction` defines a "support zone"
+    band around the pivot (for context/display, not used in the stop math
+    itself) so a near-miss touch of support still reads as being in the zone."""
+    zone_low = support - zone_atr_fraction * atr
+    zone_high = support + zone_atr_fraction * atr
+    stop_price = support - stop_buffer_atr * atr
+    return {
+        "stop_price": round(stop_price, 2),
+        "atr": round(atr, 2),
+        "support_zone_low": round(zone_low, 2),
+        "support_zone_high": round(zone_high, 2),
+        "stop_buffer_atr": stop_buffer_atr,
+        "zone_atr_fraction": zone_atr_fraction,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Exit plan engine: multi-target scale-out planning
+# ---------------------------------------------------------------------------
+
+def get_resistance_levels(
+    df: pd.DataFrame,
+    current_price: float,
+    recent_lookback: int = 60,
+    major_lookback: int = 250,
+    minimum_separation_pct: float = 0.01,
+):
+    """
+    Return:
+        1. Nearest recent pivot resistance above current price
+        2. Next higher major pivot resistance
+
+    minimum_separation_pct prevents near-duplicate resistance levels.
+    """
+    if "pivot_high" not in df.columns:
+        raise ValueError("Run add_pivots() before get_resistance_levels().")
+
+    recent = df.tail(recent_lookback)
+    major = df.tail(major_lookback)
+
+    recent_resistances = (
+        recent.loc[
+            recent["pivot_high"] & (recent["High"] > current_price),
+            "High",
+        ]
+        .dropna()
+        .astype(float)
+        .sort_values()
+    )
+
+    major_resistances = (
+        major.loc[
+            major["pivot_high"] & (major["High"] > current_price),
+            "High",
+        ]
+        .dropna()
+        .astype(float)
+        .sort_values()
+    )
+
+    nearest_resistance = (
+        float(recent_resistances.iloc[0])
+        if not recent_resistances.empty
+        else None
+    )
+
+    major_resistance = None
+
+    if nearest_resistance is not None:
+        sufficiently_higher = major_resistances[
+            major_resistances
+            > nearest_resistance * (1 + minimum_separation_pct)
+        ]
+
+        if not sufficiently_higher.empty:
+            major_resistance = float(sufficiently_higher.iloc[0])
+
+    elif not major_resistances.empty:
+        major_resistance = float(major_resistances.iloc[0])
+
+    return nearest_resistance, major_resistance
+
+
+@dataclass
+class TargetCandidate:
+    name: str
+    price: float
+    reward_per_share: float
+    reward_risk: float
+    ranking_score: float
+    notes: str
+
+
+def score_target(
+    target_name: str,
+    target_price: float,
+    entry_price: float,
+    stop_price: float,
+    atr: float,
+    nearest_resistance,
+    major_resistance,
+    rsi=None,
+    volume_ratio=None,
+    earnings_within_5_days: bool = False,
+) -> TargetCandidate:
+    """
+    Score a target using:
+        - Reward-to-risk
+        - Alignment with market structure
+        - RSI
+        - Volume ratio
+        - Earnings risk
+
+    The score is a ranking score, not a probability.
+    """
+    risk_per_share = entry_price - stop_price
+    reward_per_share = target_price - entry_price
+
+    if risk_per_share <= 0:
+        raise ValueError("Stop price must be below entry price.")
+
+    if reward_per_share <= 0:
+        raise ValueError("Target price must be above entry price.")
+
+    reward_risk = reward_per_share / risk_per_share
+
+    score = 0.0
+    notes = []
+
+    # Reward-to-risk: max 30
+    if reward_risk >= 4:
+        score += 30
+        notes.append("Excellent reward-to-risk")
+    elif reward_risk >= 3:
+        score += 25
+        notes.append("Good reward-to-risk")
+    elif reward_risk >= 2:
+        score += 15
+        notes.append("Moderate reward-to-risk")
+    else:
+        score += 5
+        notes.append("Weak reward-to-risk")
+
+    # Structure alignment: max 30
+    if (
+        nearest_resistance is not None
+        and abs(target_price - nearest_resistance) <= atr * 0.5
+    ):
+        score += 30
+        notes.append("Aligned with nearest resistance")
+
+    elif (
+        major_resistance is not None
+        and abs(target_price - major_resistance) <= atr * 0.75
+    ):
+        score += 22
+        notes.append("Aligned with major resistance")
+
+    elif target_name == "ATR projection":
+        score += 15
+        notes.append("Based on volatility projection")
+
+    # RSI: max 15
+    if rsi is not None:
+        if 50 <= rsi <= 65:
+            score += 15
+            notes.append("Healthy RSI")
+        elif 45 <= rsi < 50 or 65 < rsi <= 70:
+            score += 8
+            notes.append("Acceptable RSI")
+        else:
+            notes.append("Weak or overextended RSI")
+
+    # Volume: max 15
+    if volume_ratio is not None:
+        if volume_ratio >= 1.5:
+            score += 15
+            notes.append("Strong relative volume")
+        elif volume_ratio >= 1.0:
+            score += 8
+            notes.append("Average relative volume")
+        else:
+            notes.append("Below-average relative volume")
+
+    # Earnings: max 10, with penalty
+    if earnings_within_5_days:
+        score -= 15
+        notes.append("Near-term earnings risk")
+    else:
+        score += 10
+        notes.append("No near-term earnings risk")
+
+    score = max(0.0, min(score, 100.0))
+
+    return TargetCandidate(
+        name=target_name,
+        price=round(target_price, 4),
+        reward_per_share=round(reward_per_share, 4),
+        reward_risk=round(reward_risk, 2),
+        ranking_score=round(score, 1),
+        notes="; ".join(notes),
+    )
+
+
+def build_target_candidates(
+    entry_price: float,
+    stop_price: float,
+    atr: float,
+    nearest_resistance,
+    major_resistance,
+    atr_target_multiple: float = 3.0,
+    rsi=None,
+    volume_ratio=None,
+    earnings_within_5_days: bool = False,
+    duplicate_tolerance_atr: float = 0.25,
+):
+    """
+    Build and score:
+        - Nearest resistance target
+        - ATR projection target
+        - Major resistance target
+
+    Near-duplicate targets are merged.
+    """
+    raw_targets = []
+
+    if nearest_resistance is not None:
+        raw_targets.append(("Nearest resistance", nearest_resistance))
+
+    atr_target = entry_price + atr_target_multiple * atr
+    raw_targets.append(("ATR projection", atr_target))
+
+    if major_resistance is not None:
+        raw_targets.append(("Major resistance", major_resistance))
+
+    candidates = []
+
+    for target_name, target_price in raw_targets:
+        if target_price <= entry_price:
+            continue
+
+        candidate = score_target(
+            target_name=target_name,
+            target_price=target_price,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            atr=atr,
+            nearest_resistance=nearest_resistance,
+            major_resistance=major_resistance,
+            rsi=rsi,
+            volume_ratio=volume_ratio,
+            earnings_within_5_days=earnings_within_5_days,
+        )
+
+        candidates.append(candidate)
+
+    # Sort by target price before deduplication
+    candidates.sort(key=lambda candidate: candidate.price)
+
+    unique_candidates = []
+    tolerance = atr * duplicate_tolerance_atr
+
+    for candidate in candidates:
+        matching_index = next(
+            (
+                index
+                for index, existing in enumerate(unique_candidates)
+                if abs(candidate.price - existing.price) <= tolerance
+            ),
+            None,
+        )
+
+        if matching_index is None:
+            unique_candidates.append(candidate)
+        else:
+            existing = unique_candidates[matching_index]
+            if candidate.ranking_score > existing.ranking_score:
+                unique_candidates[matching_index] = candidate
+
+    return sorted(
+        unique_candidates,
+        key=lambda candidate: (candidate.ranking_score, candidate.reward_risk),
+        reverse=True,
+    )
+
+
+def recommend_primary_target(candidates, minimum_reward_risk=2.5):
+    """
+    Recommend the highest-ranked target that meets the minimum R:R.
+    """
+    qualifying = [
+        candidate
+        for candidate in candidates
+        if candidate.reward_risk >= minimum_reward_risk
+    ]
+
+    if not qualifying:
+        return None
+
+    return max(
+        qualifying,
+        key=lambda candidate: (candidate.ranking_score, candidate.reward_risk),
+    )
+
+
+def allocate_scale_out_shares(total_shares: int, candidates):
+    """
+    Allocate shares across up to two fixed targets plus a runner.
+
+    For 2+ targets:
+        30% at target 1
+        40% at target 2
+        remainder as runner
+
+    For 1 target:
+        70% at target 1
+        remainder as runner
+    """
+    if total_shares <= 0:
+        raise ValueError("total_shares must be positive.")
+
+    targets_by_price = sorted(candidates, key=lambda candidate: candidate.price)
+
+    if not targets_by_price:
+        return {
+            "target_1_price": None,
+            "target_1_shares": 0,
+            "target_2_price": None,
+            "target_2_shares": 0,
+            "runner_shares": total_shares,
+        }
+
+    if len(targets_by_price) == 1:
+        target_1_shares = math.floor(total_shares * 0.70)
+        runner_shares = total_shares - target_1_shares
+
+        return {
+            "target_1_price": targets_by_price[0].price,
+            "target_1_shares": target_1_shares,
+            "target_2_price": None,
+            "target_2_shares": 0,
+            "runner_shares": runner_shares,
+        }
+
+    target_1_shares = math.floor(total_shares * 0.30)
+    target_2_shares = math.floor(total_shares * 0.40)
+    runner_shares = total_shares - target_1_shares - target_2_shares
+
+    return {
+        "target_1_price": targets_by_price[0].price,
+        "target_1_shares": target_1_shares,
+        "target_2_price": targets_by_price[1].price,
+        "target_2_shares": target_2_shares,
+        "runner_shares": runner_shares,
+    }
+
+
+def build_exit_plan(
+    df: pd.DataFrame,
+    entry_price: float,
+    stop_price: float,
+    total_shares: int,
+    atr_period: int = 14,
+    pivot_left: int = 2,
+    pivot_right: int = 2,
+    recent_lookback: int = 60,
+    major_lookback: int = 250,
+    atr_target_multiple: float = 3.0,
+    rsi=None,
+    volume_ratio=None,
+    earnings_within_5_days: bool = False,
+    minimum_reward_risk: float = 2.5,
+) -> dict:
+    """
+    Complete exit planning workflow.
+    """
+    if entry_price <= 0:
+        raise ValueError("entry_price must be positive.")
+
+    if stop_price >= entry_price:
+        raise ValueError("stop_price must be below entry_price.")
+
+    if total_shares <= 0:
+        raise ValueError("total_shares must be positive.")
+
+    working = add_atr(df, period=atr_period)
+    working = add_pivots(working, left=pivot_left, right=pivot_right)
+
+    atr_value = working[f"ATR_{atr_period}"].iloc[-1]
+    if pd.isna(atr_value):
+        raise ValueError("ATR is unavailable. Provide more historical price rows.")
+    atr = float(atr_value)
+
+    nearest_resistance, major_resistance = get_resistance_levels(
+        working,
+        current_price=entry_price,
+        recent_lookback=recent_lookback,
+        major_lookback=major_lookback,
+    )
+
+    candidates = build_target_candidates(
+        entry_price=entry_price,
+        stop_price=stop_price,
+        atr=atr,
+        nearest_resistance=nearest_resistance,
+        major_resistance=major_resistance,
+        atr_target_multiple=atr_target_multiple,
+        rsi=rsi,
+        volume_ratio=volume_ratio,
+        earnings_within_5_days=earnings_within_5_days,
+    )
+
+    primary_target = recommend_primary_target(
+        candidates, minimum_reward_risk=minimum_reward_risk,
+    )
+
+    scale_out_plan = allocate_scale_out_shares(
+        total_shares=total_shares, candidates=candidates,
+    )
+
+    return {
+        "entry_price": round(entry_price, 4),
+        "stop_price": round(stop_price, 4),
+        "risk_per_share": round(entry_price - stop_price, 4),
+        "atr": round(atr, 4),
+        "nearest_resistance": (
+            round(nearest_resistance, 4) if nearest_resistance is not None else None
+        ),
+        "major_resistance": (
+            round(major_resistance, 4) if major_resistance is not None else None
+        ),
+        "primary_target": (
+            asdict(primary_target) if primary_target is not None else None
+        ),
+        "target_candidates": [asdict(candidate) for candidate in candidates],
+        "scale_out_plan": scale_out_plan,
+        "status": (
+            "TARGET_FOUND" if primary_target is not None else "NO_TARGET_MEETS_MINIMUM_RR"
+        ),
+    }
+
+
+def build_atr_trade_plan(
+    df: pd.DataFrame,
+    ticker: str,
+    portfolio_value: float = 10_000,
+    atr_period: int = 14,
+    pivot_left: int = 2,
+    pivot_right: int = 2,
+    pivot_lookback: int = 60,
+    zone_atr_fraction: float = 0.25,
+    stop_buffer_atr: float = 0.75,
+    max_risk_pct: float = 0.01,
+    max_position_pct: float = 0.15,
+) -> dict[str, Any]:
+    """
+    Complete long-trade planning engine.
+    Entry:
+        Latest closing price
+    Stop:
+        Below nearest pivot support using ATR
+    Target:
+        Nearest pivot resistance
+    """
+    working = add_atr(df, period=atr_period)
+    working = add_pivots(
+        working,
+        left=pivot_left,
+        right=pivot_right,
+    )
+    latest = working.iloc[-1]
+    entry_price = float(latest["Close"])
+    atr = float(latest[f"ATR_{atr_period}"])
+    if np.isnan(atr):
+        raise ValueError("Latest ATR is unavailable.")
+    support, resistance = find_nearest_pivot_levels(
+        working,
+        current_price=entry_price,
+        lookback_bars=pivot_lookback,
+    )
+    if support is None:
+        return {
+            "ticker": ticker,
+            "status": "PASS",
+            "reason": "No recent pivot support below the current price.",
+        }
+    if resistance is None:
+        return {
+            "ticker": ticker,
+            "status": "REVIEW",
+            "reason": "No recent pivot resistance above the current price.",
+        }
+    stop_details = calculate_atr_stop(
+        support=support,
+        atr=atr,
+        zone_atr_fraction=zone_atr_fraction,
+        stop_buffer_atr=stop_buffer_atr,
+    )
+    stop_price = stop_details["stop_price"]
+    plan = calculate_trade_plan(
+        ticker=ticker,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        target_price=resistance,
+        portfolio_value=portfolio_value,
+        max_risk_pct=max_risk_pct,
+        max_position_pct=max_position_pct,
+    )
+    if plan is None:
+        return {
+            "ticker": ticker,
+            "status": "PASS",
+            "reason": "Risk or reward per share was not positive (stop/target inverted around entry).",
+        }
+    plan.update(stop_details)
+    if plan["shares"] < 1:
+        plan["status"] = "PASS"
+        plan["reason"] = "Position size is below one whole share."
+    elif plan["reward_risk"] < 2.5:
+        plan["status"] = "PASS"
+        plan["reason"] = "Reward-to-risk is below 2.5."
+    elif plan["reward_risk"] < 3:
+        plan["status"] = "WATCH"
+        plan["reason"] = "Reward-to-risk is acceptable but below 3."
+    else:
+        plan["status"] = "CANDIDATE"
+        plan["reason"] = "ATR stop and reward-to-risk criteria are satisfied."
+    return plan
 
 
 def compute_technical_indicators(tickers):
@@ -980,6 +1569,135 @@ def format_trade_plan_table(watchlist, plans):
     return "\n".join(lines) if watchlist else "(watchlist is empty)"
 
 
+def build_atr_trade_plans(watchlist, trade_settings, indicators=None, scores=None):
+    """Re-fetches price history for each shortlisted ticker and runs it
+    through build_atr_trade_plan. Kept as a separate fetch (rather than
+    reusing compute_technical_indicators' cached results) since that
+    function doesn't retain the raw OHLC frame needed for ATR.
+
+    When a plan succeeds (has entry/stop/shares) and `indicators`/`scores`
+    are supplied, also attaches a multi-target exit plan under the
+    'exit_plan' key, using that ticker's RSI, volume ratio, and whether
+    earnings fall within the next 5 trading days."""
+    indicators = indicators or {}
+    scores = scores or {}
+    plans = {}
+    for ticker in watchlist:
+        try:
+            df = yf.download(
+                tickers=[ticker], period="15mo", interval="1d",
+                progress=False, auto_adjust=False,
+            )
+            df = df.dropna(subset=["Close", "High", "Low", "Volume"])
+            if df is None or len(df) < 30:
+                plans[ticker] = {
+                    "ticker": ticker, "status": "PASS",
+                    "reason": "insufficient price history for ATR calculation",
+                }
+                continue
+            plan = build_atr_trade_plan(
+                df, ticker,
+                portfolio_value=trade_settings["portfolio_value"],
+                max_risk_pct=trade_settings["max_risk_pct"],
+                max_position_pct=trade_settings["max_position_pct"],
+            )
+            if plan.get("shares", 0) and plan.get("entry") is not None:
+                try:
+                    ind = indicators.get(ticker, {})
+                    s = scores.get(ticker, {})
+                    earnings_days = s.get("earnings_days_away")
+                    exit_plan = build_exit_plan(
+                        df,
+                        entry_price=plan["entry"],
+                        stop_price=plan["stop_loss"],
+                        total_shares=plan["shares"],
+                        rsi=ind.get("rsi"),
+                        volume_ratio=ind.get("vol_ratio"),
+                        earnings_within_5_days=(earnings_days is not None and earnings_days <= 5),
+                    )
+                    plan["exit_plan"] = exit_plan
+                except Exception as e:
+                    plan["exit_plan"] = None
+                    plan["exit_plan_error"] = str(e)
+            plans[ticker] = plan
+        except Exception as e:
+            plans[ticker] = {"ticker": ticker, "status": "PASS", "reason": f"error: {e}"}
+    return plans
+
+
+def format_atr_trade_plan_table(watchlist, plans):
+    lines = []
+    header = (
+        f"{'TICKER':8}{'STATUS':>10}{'ENTRY':>9}{'STOP':>9}{'TARGET':>9}"
+        f"{'ATR':>7}{'SHARES':>8}{'R:R':>7}{'REASON':>50}"
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+    for ticker in watchlist:
+        plan = plans.get(ticker)
+        if not plan:
+            lines.append(f"{ticker:8}  (no ATR trade plan available)")
+            continue
+        status = plan.get("status", "n/a")
+        reason = plan.get("reason", "")
+        if "entry" in plan:
+            lines.append(
+                f"{ticker:8}{status:>10}{plan['entry']:>9.2f}{plan['stop_loss']:>9.2f}"
+                f"{plan['target_sell']:>9.2f}{plan['atr']:>7.2f}{plan['shares']:>8}"
+                f"{plan['reward_risk']:>6.2f}x{reason:>50}"
+            )
+        else:
+            lines.append(f"{ticker:8}{status:>10}{'':>44}{reason:>50}")
+    return "\n".join(lines) if watchlist else "(watchlist is empty)"
+
+
+def format_exit_plan_section(watchlist, atr_plans):
+    """Multi-target scale-out plan per ticker: every scored target candidate
+    (name, price, reward:risk, 0-100 ranking score, notes), which one (if
+    any) is the primary target, and the fixed-percentage share allocation
+    across target 1 / target 2 / runner."""
+    blocks = []
+    for ticker in watchlist:
+        plan = atr_plans.get(ticker)
+        exit_plan = plan.get("exit_plan") if plan else None
+        if not exit_plan:
+            error = plan.get("exit_plan_error") if plan else None
+            reason = f" ({error})" if error else ""
+            blocks.append(f"{ticker}: no exit plan available{reason}")
+            continue
+
+        lines = [
+            f"{ticker} - status: {exit_plan['status']} - entry {exit_plan['entry_price']}, "
+            f"stop {exit_plan['stop_price']}, risk/share {exit_plan['risk_per_share']}, "
+            f"ATR {exit_plan['atr']}"
+        ]
+
+        primary = exit_plan["primary_target"]
+        primary_name = primary["name"] if primary else None
+
+        for candidate in exit_plan["target_candidates"]:
+            flag = "  <- PRIMARY TARGET" if candidate["name"] == primary_name else ""
+            lines.append(
+                f"  [{candidate['name']}] target {candidate['price']}, "
+                f"R:R {candidate['reward_risk']}x, score {candidate['ranking_score']}/100{flag}"
+            )
+            lines.append(f"      {candidate['notes']}")
+
+        if primary is None and exit_plan["target_candidates"]:
+            lines.append(
+                "  No candidate met the minimum 2.5 reward:risk - none is endorsed as a primary target."
+            )
+
+        scale = exit_plan["scale_out_plan"]
+        t1 = f"{scale['target_1_price']} = {scale['target_1_shares']} shares" if scale["target_1_price"] is not None else "n/a"
+        t2 = f"{scale['target_2_price']} = {scale['target_2_shares']} shares" if scale["target_2_price"] is not None else "n/a"
+        lines.append(f"  Scale-out: target 1 @ {t1}, target 2 @ {t2}, runner = {scale['runner_shares']} shares")
+
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks) if watchlist else "(watchlist is empty)"
+
+
 def send_email(subject, body):
     msg = MIMEText(body)
     msg["Subject"] = subject
@@ -1035,6 +1753,10 @@ def main():
     trade_settings = portfolio["trade_settings"]
     trade_plans = build_trade_plans(watchlist_us, indicators, trade_settings)
     trade_plan_table = format_trade_plan_table(watchlist_us, trade_plans)
+
+    atr_trade_plans = build_atr_trade_plans(watchlist_us, trade_settings, indicators, scores)
+    exit_plan_section = format_exit_plan_section(watchlist_us, atr_trade_plans)
+    atr_trade_plan_table = format_atr_trade_plan_table(watchlist_us, atr_trade_plans)
 
     premarket_gaps = build_premarket_gaps(watchlist_us)
     premarket_table, premarket_explanations = format_premarket_table(watchlist_us, premarket_gaps)
@@ -1100,6 +1822,32 @@ Adjust these in portfolio.json under "trade_settings". Shares = the smaller of
 (risk cap / risk per share) and (position cap / entry price), rounded down.
 
 {trade_plan_table}
+
+--------------------------------------------------
+ATR-BASED TRADE PLAN (volatility-adjusted stop, alternative to the fixed-buffer plan above)
+--------------------------------------------------
+Entry = latest close. Stop = nearest pivot support minus 0.75x ATR(14) (instead
+of a fixed 0.5% buffer). Target = nearest pivot resistance.
+Status: CANDIDATE = R:R >= 3 and passes sizing | WATCH = R:R 2.5-3 | PASS = R:R < 2.5,
+position rounds to 0 shares, or no usable support/resistance was found.
+
+{atr_trade_plan_table}
+
+--------------------------------------------------
+EXIT PLAN - MULTI-TARGET SCALE-OUT (per shortlisted ticker)
+--------------------------------------------------
+For each ticker with a valid ATR trade plan: up to three exit targets from
+independent sources (a volatility-based ATR extension, the nearest chart
+resistance, and a longer-term "major" resistance for a partial runner
+position), each scored 0-100 on reward:risk, structure alignment, RSI,
+volume, and earnings timing. Near-duplicate targets are merged, keeping the
+higher-scored one. The PRIMARY TARGET is the highest-scored candidate among
+those clearing a 2.5 reward:risk floor - if none clear it, no primary target
+is shown (status: NO_TARGET_MEETS_MINIMUM_RR) rather than falling back to a
+weaker one. Shares are split 30% / 40% / runner across target 1, target 2,
+and whatever's left (70% / runner if only one target exists).
+
+{exit_plan_section}
 
 --------------------------------------------------
 PRE-MARKET GAP CHECK (shortlisted names only)
