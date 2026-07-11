@@ -34,7 +34,7 @@ import smtplib
 import sys
 from dataclasses import dataclass, asdict
 from typing import Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 
 import yfinance as yf
@@ -75,6 +75,110 @@ DEFAULT_TRADE_SETTINGS = {
     "max_risk_pct": 0.01,
     "max_position_pct": 0.15,
 }
+
+
+def is_weekend():
+    """True on Saturday/Sunday. GitHub Actions runs in UTC, but for the two
+    scheduled run times in this project (8pm SGT / 8:30am SGT) the UTC
+    weekday matches the SGT weekday exactly - no date-rollover edge case."""
+    return datetime.now().weekday() >= 5
+
+
+def last_trading_day_label():
+    """For weekend runs, labels which prior weekday's close the data
+    reflects (Saturday -> Friday, Sunday -> Friday)."""
+    now = datetime.now()
+    weekday = now.weekday()
+    if weekday == 5:  # Saturday
+        as_of = now - timedelta(days=1)
+    elif weekday == 6:  # Sunday
+        as_of = now - timedelta(days=2)
+    else:
+        as_of = now
+    return as_of.strftime("%d %b %Y")
+
+
+def closest_rejects(stage2_eliminated, n=5):
+    """The N Stage-2 rejects with the best (closest to qualifying)
+    reward:risk, for a short summary instead of printing the full list."""
+    with_rr = [e for e in stage2_eliminated if e["reward_risk"] is not None]
+    without_rr = [e for e in stage2_eliminated if e["reward_risk"] is None]
+    with_rr.sort(key=lambda e: e["reward_risk"], reverse=True)
+    return (with_rr + without_rr)[:n]
+
+
+def get_execution_status(ticker, trade_plans, atr_trade_plans):
+    """Separates 'did this ticker qualify' (always Qualified for anything
+    on the final watchlist) from 'can we actually act on it today' - since
+    a ticker can pass the scoring gates but still have incomplete sizing
+    data (e.g. ATR unavailable), which is a materially different situation."""
+    fixed_plan = trade_plans.get(ticker)
+    atr_plan = atr_trade_plans.get(ticker)
+    atr_ready = bool(atr_plan and atr_plan.get("entry") is not None and atr_plan.get("shares", 0) > 0)
+    fixed_ready = bool(fixed_plan and fixed_plan.get("shares", 0) > 0)
+
+    if atr_ready and fixed_ready:
+        return "Ready"
+    if fixed_ready and not atr_ready:
+        reason = atr_plan.get("reason", "ATR data incomplete") if atr_plan else "ATR data incomplete"
+        return f"Hold - {reason}"
+    if not fixed_ready and not atr_ready:
+        return "Hold - sizing unavailable (risk/reward not positive at current caps)"
+    return "Hold - fixed-buffer sizing unavailable"
+
+
+def build_decision_summary(
+    holdings, portfolio_action_count, watchlist, scores, trade_plans,
+    atr_trade_plans, weekend, data_quality_count,
+):
+    """One-paragraph, decision-first summary for the very top of the email -
+    the single most important message, stated plainly before any tables."""
+    parts = []
+
+    if not holdings:
+        parts.append("No current holdings.")
+    else:
+        action_word = "action" if portfolio_action_count == 1 else "actions"
+        if portfolio_action_count == 0:
+            parts.append(f"{len(holdings)} holding(s), no actions needed today.")
+        else:
+            parts.append(f"{len(holdings)} holding(s), {portfolio_action_count} {action_word} needed - see Portfolio Actions.")
+
+    if not watchlist:
+        parts.append("No candidates passed today's screen.")
+    else:
+        ranked = sorted(watchlist, key=lambda t: scores.get(t, {}).get("total", 0), reverse=True)
+        top_ticker = ranked[0]
+        top_score = scores.get(top_ticker, {}).get("total", "n/a")
+        fixed_plan = trade_plans.get(top_ticker)
+        rr = fixed_plan["reward_risk"] if fixed_plan else None
+        rr_text = f"fixed-buffer R:R {rr}x" if rr is not None else "fixed-buffer R:R unavailable"
+
+        if len(watchlist) == 1:
+            lead = f"One candidate passed: {top_ticker}."
+        else:
+            lead = f"{len(watchlist)} candidates passed. Strongest: {top_ticker} (score {top_score}/85)."
+
+        exec_status = get_execution_status(top_ticker, trade_plans, atr_trade_plans)
+        if exec_status == "Ready":
+            action_text = f"{rr_text}. Both sizing plans are ready."
+        else:
+            hold_reason = exec_status.split("-", 1)[1].strip() if "-" in exec_status else exec_status
+            action_text = (
+                f"{rr_text}, but execution is on hold ({hold_reason}) - do not place a "
+                f"trade from the automated recommendation until that's resolved."
+            )
+
+        parts.append(f"{lead} {action_text}")
+
+    if weekend:
+        parts.append(f"US market closed (weekend) - figures reflect {last_trading_day_label()}'s close.")
+
+    if data_quality_count:
+        alert_word = "alert" if data_quality_count == 1 else "alerts"
+        parts.append(f"{data_quality_count} data-quality {alert_word} today - see Data-Quality Alerts.")
+
+    return " ".join(parts)
 
 
 def load_portfolio():
@@ -172,6 +276,11 @@ def format_holdings_table(rows):
 
 
 def get_claude_analysis(holdings_rows, total_cost, total_value):
+    """Returns (analysis_text, verdicts) where verdicts is {ticker: "HOLD"|"TRIM"|"SELL"|"ADD"},
+    used to build the top-of-email decision summary (e.g. "2 actions needed")."""
+    if not holdings_rows:
+        return "No current holdings.", {}
+
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
     portfolio_summary = json.dumps(holdings_rows, indent=2)
@@ -200,7 +309,12 @@ in the last 24-48 hours, write a concise daily note that:
    can act on. Remind them, briefly, this isn't personalized financial advice.
 
 Be honest and specific. If nothing changed for a name, say so briefly rather than
-padding it."""
+padding it.
+
+Finally, after your written analysis, add a line containing exactly
+VERDICTS_JSON: followed by ONLY a JSON object (no markdown fences) mapping each
+ticker to exactly one of "HOLD", "TRIM", "SELL", or "ADD" - your one-word
+verdict for that holding, matching the read you gave it above."""
 
     response = client.messages.create(
         model=MODEL,
@@ -210,7 +324,26 @@ padding it."""
     )
 
     text_parts = [block.text for block in response.content if block.type == "text"]
-    return "\n".join(text_parts)
+    full_text = "\n".join(text_parts)
+
+    analysis_text = full_text
+    verdicts = {}
+    if "VERDICTS_JSON:" in full_text:
+        analysis_text, _, verdict_raw = full_text.partition("VERDICTS_JSON:")
+        analysis_text = analysis_text.strip()
+        verdict_raw = verdict_raw.strip()
+        if "```" in verdict_raw:
+            verdict_raw = verdict_raw.split("```")[1] if verdict_raw.count("```") >= 2 else verdict_raw
+            verdict_raw = verdict_raw.replace("json", "", 1).strip()
+        start = verdict_raw.find("{")
+        end = verdict_raw.rfind("}")
+        if start != -1 and end != -1:
+            try:
+                verdicts = json.loads(verdict_raw[start:end + 1])
+            except Exception:
+                verdicts = {}
+
+    return analysis_text, verdicts
 
 
 # ---------------------------------------------------------------------------
@@ -1456,7 +1589,7 @@ def format_watchlist_table(watchlist, indicators, scores):
     header = (
         f"{'TICKER':8}{'SCORE':>9}{'TREND':>8}{'MOM':>6}{'EARN':>6}{'LOC':>7}"
         f"{'PRICE':>10}{'20EMA':>9}{'50EMA':>9}{'RSI':>7}{'VOLx(20d)':>11}"
-        f"{'PIVOT HI':>10}{'PIVOT LO':>10}{'EARN(days)':>12}"
+        f"{'LAST PIV HI':>12}{'LAST PIV LO':>12}{'EARN(days)':>12}"
     )
     lines.append(header)
     lines.append("-" * len(header))
@@ -1479,7 +1612,7 @@ def format_watchlist_table(watchlist, indicators, scores):
             f"{s['earnings']:>5}/10{s['location']:>5}/30"
             f"{ind['price']:>10.2f}{ind['ema20']:>9.2f}{ind['ema50']:>9.2f}"
             f"{ind['rsi']:>7.1f}{(ind['vol_ratio'] or 0):>11.2f}"
-            f"{pivot_hi_str:>8}{hh_flag:>2}{pivot_lo_str:>8}{hl_flag:>2}{days_str:>12}"
+            f"{pivot_hi_str:>10}{hh_flag:>2}{pivot_lo_str:>10}{hl_flag:>2}{days_str:>12}"
         )
     return "\n".join(lines) if watchlist else "(watchlist is empty)"
 
@@ -1493,8 +1626,8 @@ def format_levels_table(watchlist, indicators):
 
     lines = []
     header = (
-        f"{'TICKER':8}{'PRICE':>10}{'SUPPORT':>10}{'RESIST':>10}"
-        f"{'STOP':>10}{'TARGET':>10}{'RISK':>8}{'REWARD':>9}{'R:R':>7}"
+        f"{'TICKER':8}{'PRICE':>10}{'NEAREST SUPP':>13}{'NEAREST RESIST':>15}"
+        f"{'STOP-LOSS':>11}{'TAKE-PROFIT':>13}{'RISK':>8}{'REWARD':>9}{'R:R':>7}"
     )
     lines.append(header)
     lines.append("-" * len(header))
@@ -1510,14 +1643,14 @@ def format_levels_table(watchlist, indicators):
         resistance_str = f"{resistance:.2f}" if resistance is not None else "n/a"
         if rr:
             lines.append(
-                f"{ticker:8}{ind['price']:>10.2f}{support_str:>10}{resistance_str:>10}"
-                f"{rr['stop']:>10.2f}{rr['target']:>10.2f}{rr['risk']:>8.2f}"
+                f"{ticker:8}{ind['price']:>10.2f}{support_str:>13}{resistance_str:>15}"
+                f"{rr['stop']:>11.2f}{rr['target']:>13.2f}{rr['risk']:>8.2f}"
                 f"{rr['reward']:>9.2f}{rr['reward_risk']:>6.2f}x"
             )
         else:
             lines.append(
-                f"{ticker:8}{ind['price']:>10.2f}{support_str:>10}{resistance_str:>10}"
-                f"{'n/a':>10}{'n/a':>10}{'n/a':>8}{'n/a':>9}{'n/a':>7}"
+                f"{ticker:8}{ind['price']:>10.2f}{support_str:>13}{resistance_str:>15}"
+                f"{'n/a':>11}{'n/a':>13}{'n/a':>8}{'n/a':>9}{'n/a':>7}"
             )
     return "\n".join(lines) if watchlist else "(watchlist is empty)"
 
@@ -1548,8 +1681,8 @@ def build_trade_plans(watchlist, indicators, trade_settings):
 def format_trade_plan_table(watchlist, plans):
     lines = []
     header = (
-        f"{'TICKER':8}{'ENTRY':>9}{'STOP':>9}{'TARGET':>9}"
-        f"{'SHARES':>8}{'INVEST':>10}{'MAX LOSS':>10}{'MAX PROFIT':>12}{'R:R':>6}"
+        f"{'TICKER':8}{'ENTRY':>9}{'STOP-LOSS':>11}{'TAKE-PROFIT':>13}"
+        f"{'SHARES':>8}{'POSITION VALUE':>16}{'MAX LOSS':>10}{'MAX PROFIT':>12}{'R:R':>6}"
     )
     lines.append(header)
     lines.append("-" * len(header))
@@ -1562,11 +1695,30 @@ def format_trade_plan_table(watchlist, plans):
             lines.append(f"{ticker:8}  (position size rounds to 0 shares at current caps)")
             continue
         lines.append(
-            f"{ticker:8}{plan['entry']:>9.2f}{plan['stop_loss']:>9.2f}{plan['target_sell']:>9.2f}"
-            f"{plan['shares']:>8}{plan['investment']:>10.2f}{plan['max_loss']:>10.2f}"
+            f"{ticker:8}{plan['entry']:>9.2f}{plan['stop_loss']:>11.2f}{plan['target_sell']:>13.2f}"
+            f"{plan['shares']:>8}{plan['investment']:>16.2f}{plan['max_loss']:>10.2f}"
             f"{plan['max_profit']:>12.2f}{plan['reward_risk']:>5.2f}x"
         )
     return "\n".join(lines) if watchlist else "(watchlist is empty)"
+
+
+def humanize_exception(context, e):
+    """Turns a raw exception into a short, clean, user-facing reason. The
+    raw exception is never shown in the email - it's printed to the
+    console/GitHub Actions log separately by the caller, for debugging."""
+    msg = str(e)
+    if "Missing required columns" in msg:
+        clean = "Price-history columns missing from the data feed."
+    elif "ATR is unavailable" in msg or "insufficient" in msg.lower():
+        clean = "Not enough price history available to calculate ATR."
+    elif "Stop price must be below" in msg or "Target price must be above" in msg:
+        clean = "Stop/target levels were inconsistent with the entry price."
+    elif "total_shares must be positive" in msg:
+        clean = "Position size resolved to zero shares."
+    else:
+        clean = "An internal calculation error occurred."
+    print(f"[data-quality] {context}: {msg}")  # raw detail goes to the log only
+    return clean
 
 
 def build_atr_trade_plans(watchlist, trade_settings, indicators=None, scores=None):
@@ -1578,10 +1730,15 @@ def build_atr_trade_plans(watchlist, trade_settings, indicators=None, scores=Non
     When a plan succeeds (has entry/stop/shares) and `indicators`/`scores`
     are supplied, also attaches a multi-target exit plan under the
     'exit_plan' key, using that ticker's RSI, volume ratio, and whether
-    earnings fall within the next 5 trading days."""
+    earnings fall within the next 5 trading days.
+
+    Returns (plans, data_quality_alerts) - the second is a list of clean,
+    human-readable strings for any failure, suitable for the email; the
+    raw exception text is only ever printed to the console/log."""
     indicators = indicators or {}
     scores = scores or {}
     plans = {}
+    alerts = []
     for ticker in watchlist:
         try:
             df = yf.download(
@@ -1592,8 +1749,9 @@ def build_atr_trade_plans(watchlist, trade_settings, indicators=None, scores=Non
             if df is None or len(df) < 30:
                 plans[ticker] = {
                     "ticker": ticker, "status": "PASS",
-                    "reason": "insufficient price history for ATR calculation",
+                    "reason": "Not enough price history available for ATR sizing.",
                 }
+                alerts.append(f"{ticker}: ATR plan unavailable - not enough price history.")
                 continue
             plan = build_atr_trade_plan(
                 df, ticker,
@@ -1617,18 +1775,22 @@ def build_atr_trade_plans(watchlist, trade_settings, indicators=None, scores=Non
                     )
                     plan["exit_plan"] = exit_plan
                 except Exception as e:
+                    clean_reason = humanize_exception(f"{ticker} exit plan", e)
                     plan["exit_plan"] = None
-                    plan["exit_plan_error"] = str(e)
+                    plan["exit_plan_reason"] = clean_reason
+                    alerts.append(f"{ticker}: exit plan unavailable - {clean_reason}")
             plans[ticker] = plan
         except Exception as e:
-            plans[ticker] = {"ticker": ticker, "status": "PASS", "reason": f"error: {e}"}
-    return plans
+            clean_reason = humanize_exception(f"{ticker} ATR trade plan", e)
+            plans[ticker] = {"ticker": ticker, "status": "PASS", "reason": clean_reason}
+            alerts.append(f"{ticker}: ATR plan unavailable - {clean_reason}")
+    return plans, alerts
 
 
 def format_atr_trade_plan_table(watchlist, plans):
     lines = []
     header = (
-        f"{'TICKER':8}{'STATUS':>10}{'ENTRY':>9}{'STOP':>9}{'TARGET':>9}"
+        f"{'TICKER':8}{'STATUS':>10}{'ENTRY':>9}{'STOP-LOSS':>11}{'TAKE-PROFIT':>13}"
         f"{'ATR':>7}{'SHARES':>8}{'R:R':>7}{'REASON':>50}"
     )
     lines.append(header)
@@ -1642,12 +1804,12 @@ def format_atr_trade_plan_table(watchlist, plans):
         reason = plan.get("reason", "")
         if "entry" in plan:
             lines.append(
-                f"{ticker:8}{status:>10}{plan['entry']:>9.2f}{plan['stop_loss']:>9.2f}"
-                f"{plan['target_sell']:>9.2f}{plan['atr']:>7.2f}{plan['shares']:>8}"
+                f"{ticker:8}{status:>10}{plan['entry']:>9.2f}{plan['stop_loss']:>11.2f}"
+                f"{plan['target_sell']:>13.2f}{plan['atr']:>7.2f}{plan['shares']:>8}"
                 f"{plan['reward_risk']:>6.2f}x{reason:>50}"
             )
         else:
-            lines.append(f"{ticker:8}{status:>10}{'':>44}{reason:>50}")
+            lines.append(f"{ticker:8}{status:>10}{'':>48}{reason:>50}")
     return "\n".join(lines) if watchlist else "(watchlist is empty)"
 
 
@@ -1655,20 +1817,27 @@ def format_exit_plan_section(watchlist, atr_plans):
     """Multi-target scale-out plan per ticker: every scored target candidate
     (name, price, reward:risk, 0-100 ranking score, notes), which one (if
     any) is the primary target, and the fixed-percentage share allocation
-    across target 1 / target 2 / runner."""
+    across target 1 / target 2 / runner. Collapses to a single clean line
+    per ticker (or for the whole section) when no exit plan exists - no
+    value in printing the full methodology when there's nothing to show."""
+    if not watchlist:
+        return "(watchlist is empty)"
+
     blocks = []
+    any_succeeded = False
     for ticker in watchlist:
         plan = atr_plans.get(ticker)
         exit_plan = plan.get("exit_plan") if plan else None
         if not exit_plan:
-            error = plan.get("exit_plan_error") if plan else None
-            reason = f" ({error})" if error else ""
-            blocks.append(f"{ticker}: no exit plan available{reason}")
+            reason = plan.get("exit_plan_reason") if plan else None
+            reason_text = reason or "the ATR trade plan did not succeed for this ticker"
+            blocks.append(f"{ticker}: exit plan unavailable - {reason_text}.")
             continue
 
+        any_succeeded = True
         lines = [
             f"{ticker} - status: {exit_plan['status']} - entry {exit_plan['entry_price']}, "
-            f"stop {exit_plan['stop_price']}, risk/share {exit_plan['risk_per_share']}, "
+            f"stop-loss {exit_plan['stop_price']}, risk/share {exit_plan['risk_per_share']}, "
             f"ATR {exit_plan['atr']}"
         ]
 
@@ -1678,7 +1847,7 @@ def format_exit_plan_section(watchlist, atr_plans):
         for candidate in exit_plan["target_candidates"]:
             flag = "  <- PRIMARY TARGET" if candidate["name"] == primary_name else ""
             lines.append(
-                f"  [{candidate['name']}] target {candidate['price']}, "
+                f"  [{candidate['name']}] take-profit {candidate['price']}, "
                 f"R:R {candidate['reward_risk']}x, score {candidate['ranking_score']}/100{flag}"
             )
             lines.append(f"      {candidate['notes']}")
@@ -1695,7 +1864,10 @@ def format_exit_plan_section(watchlist, atr_plans):
 
         blocks.append("\n".join(lines))
 
-    return "\n\n".join(blocks) if watchlist else "(watchlist is empty)"
+    if not any_succeeded:
+        return "Exit plan unavailable for every shortlisted ticker - see Data-quality alerts below."
+
+    return "\n\n".join(blocks)
 
 
 def send_email(subject, body):
@@ -1714,16 +1886,23 @@ def main():
     holdings = portfolio.get("holdings", [])
     watchlist_us = portfolio.get("watchlist_us", [])
     holdings_tickers = [h["ticker"] for h in holdings]
+    weekend = is_weekend()
+    data_quality_alerts = []
 
     # --- Holdings: live price + qualitative hold/sell read ---
     snapshots = {h["ticker"]: fetch_snapshot(h["ticker"]) for h in holdings}
     holdings_rows, total_cost, total_value = build_holdings_table(holdings, snapshots)
-    holdings_table = format_holdings_table(holdings_rows) if holdings_rows else "(no holdings logged yet)"
+    holdings_table = format_holdings_table(holdings_rows) if holdings_rows else ""
 
     try:
-        analysis = get_claude_analysis(holdings_rows, total_cost, total_value)
+        analysis, verdicts = get_claude_analysis(holdings_rows, total_cost, total_value)
     except Exception as e:
-        analysis = f"[Claude analysis failed: {e}]"
+        clean = humanize_exception("holdings analysis", e)
+        analysis = f"Holdings analysis unavailable - {clean}"
+        verdicts = {}
+        data_quality_alerts.append(f"Holdings analysis unavailable - {clean}")
+
+    portfolio_action_count = sum(1 for v in verdicts.values() if v != "HOLD")
 
     # --- Watchlist: auto-remove anything now actually owned ---
     auto_removed = [t for t in watchlist_us if t in holdings_tickers]
@@ -1739,14 +1918,24 @@ def main():
     except Exception as e:
         indicators, scores = {}, {}
         stage1_shortlist, stage2_eliminated = [], []
-        changes_log.append(f"[Watchlist screen failed: {e}]")
+        clean = humanize_exception("watchlist screen", e)
+        changes_log.append(f"- Watchlist screen failed: {clean}")
+        data_quality_alerts.append(f"Watchlist screen failed - {clean}")
 
     portfolio["watchlist_us"] = watchlist_us
     save_portfolio(portfolio)  # always save: even "no changes" reflects a fresh screen run
 
     changes_text = "\n".join(changes_log) if changes_log else "(no changes today)"
-    stage1_table = format_stage1_table(stage1_shortlist)
-    stage2_table = format_stage2_eliminated_table(stage2_eliminated)
+
+    # --- Full Stage 1 / Stage 2 detail: console/log only, never in the email body ---
+    print("=" * 70)
+    print(f"FULL STAGE 1 SHORTLIST ({len(stage1_shortlist)}) - log only, not in email")
+    print(format_stage1_table(stage1_shortlist))
+    print()
+    print(f"FULL STAGE 2 ELIMINATIONS ({len(stage2_eliminated)}) - log only, not in email")
+    print(format_stage2_eliminated_table(stage2_eliminated))
+    print("=" * 70)
+
     watchlist_table = format_watchlist_table(watchlist_us, indicators, scores)
     levels_table = format_levels_table(watchlist_us, indicators)
 
@@ -1754,111 +1943,139 @@ def main():
     trade_plans = build_trade_plans(watchlist_us, indicators, trade_settings)
     trade_plan_table = format_trade_plan_table(watchlist_us, trade_plans)
 
-    atr_trade_plans = build_atr_trade_plans(watchlist_us, trade_settings, indicators, scores)
+    atr_trade_plans, atr_alerts = build_atr_trade_plans(watchlist_us, trade_settings, indicators, scores)
+    data_quality_alerts += atr_alerts
     exit_plan_section = format_exit_plan_section(watchlist_us, atr_trade_plans)
     atr_trade_plan_table = format_atr_trade_plan_table(watchlist_us, atr_trade_plans)
 
-    premarket_gaps = build_premarket_gaps(watchlist_us)
-    premarket_table, premarket_explanations = format_premarket_table(watchlist_us, premarket_gaps)
+    if weekend:
+        premarket_section = "Not applicable - weekend, US market closed."
+    else:
+        try:
+            premarket_gaps = build_premarket_gaps(watchlist_us)
+            premarket_table, premarket_explanations = format_premarket_table(watchlist_us, premarket_gaps)
+            premarket_section = (
+                "gap % = (pre-market price - previous close) / previous close x 100\n"
+                "<1%: OK - plan unchanged | 1-3%: Recalculate entry/RR | >3%: Review manually - large gap\n\n"
+                f"{premarket_table}\n\nWhy the significant gaps happened:\n{premarket_explanations}"
+            )
+        except Exception as e:
+            clean = humanize_exception("pre-market gap check", e)
+            premarket_section = f"Pre-market gap check unavailable - {clean}"
+            data_quality_alerts.append(f"Pre-market gap check unavailable - {clean}")
 
     overall_pl_pct = (
         round((total_value - total_cost) / total_cost * 100, 2) if total_cost else 0
     )
 
-    body = f"""DAILY STOCK NOTE - {datetime.now().strftime('%A, %B %d, %Y')}
+    # --- Decision summary: the single most important message, stated first ---
+    decision_summary = build_decision_summary(
+        holdings, portfolio_action_count, watchlist_us, scores, trade_plans,
+        atr_trade_plans, weekend, len(data_quality_alerts),
+    )
 
-PORTFOLIO SNAPSHOT
-Total cost basis: ${total_cost:,.2f}
-Total current value: ${total_value:,.2f}
-Overall unrealized P/L: {overall_pl_pct}%
+    rejects = closest_rejects(stage2_eliminated, n=5)
+    if rejects:
+        rejects_lines = "\n".join(
+            f"  {r['ticker']}: {r['reward_risk']}x" if r["reward_risk"] is not None else f"  {r['ticker']}: n/a"
+            for r in rejects
+        )
+    else:
+        rejects_lines = "  (none)"
 
-{holdings_table}
+    data_quality_text = (
+        "\n".join(f"- {a}" for a in data_quality_alerts) if data_quality_alerts else "None."
+    )
 
---------------------------------------------------
-ANALYSIS
---------------------------------------------------
-{analysis}
+    report_label = "WEEKEND STRATEGY REVIEW" if weekend else "DAILY PRE-MARKET NOTE"
+    if weekend:
+        price_data_line = f"Price data through: {last_trading_day_label()} US market close"
+    else:
+        price_data_line = f"Price data through: {datetime.now().strftime('%d %b %Y')} (most recent available)"
+    premarket_freshness_line = (
+        "Premarket data: Not applicable - weekend"
+        if weekend else
+        f"Premarket data: as of {datetime.now().strftime('%d %b %Y %H:%M')} run time"
+    )
 
---------------------------------------------------
-STAGE 1 - PASSED BASE SCORE MINIMUM (top {STAGE1_SHORTLIST_SIZE}, ranked by Trend+Momentum+Earnings, min {BASE_SCORE_MINIMUM}/55)
---------------------------------------------------
-{stage1_table}
+    # --- New Trade Candidates: setup status (always Qualified for this list)
+    #     vs execution status (can we actually size/act on it today) ---
+    candidate_lines = []
+    for ticker in sorted(watchlist_us, key=lambda t: scores.get(t, {}).get("total", 0), reverse=True):
+        s = scores.get(ticker, {})
+        fixed_plan = trade_plans.get(ticker)
+        exec_status = get_execution_status(ticker, trade_plans, atr_trade_plans)
+        rr = fixed_plan["reward_risk"] if fixed_plan else "n/a"
+        candidate_lines.append(
+            f"{ticker}: score {s.get('total', 'n/a')}/85 | Setup status: Qualified | "
+            f"Execution status: {exec_status} | Fixed-buffer reward:risk: {rr}x"
+        )
+    candidates_summary = "\n".join(candidate_lines) if candidate_lines else "(none)"
 
---------------------------------------------------
-STAGE 2 - ELIMINATED ON REWARD:RISK (from the Stage 1 shortlist above, min {REWARD_RISK_MINIMUM}x)
---------------------------------------------------
-{stage2_table}
+    holdings_section = (
+        f"{holdings_table}\n\n{analysis}" if holdings_rows else "Current holdings: None\n\n" + analysis
+    )
 
---------------------------------------------------
-WATCHLIST (US) - FINAL SHORTLIST (top {WATCHLIST_MAX_US} by total score, out of 85)
---------------------------------------------------
-Trend (25): price>20EMA +10, 20EMA>50EMA +10, higher highs +5
-Momentum (20): RSI 50-60 +10 / 60-65 +8 / 65-70 +5 / >70 +0; Volume vs 20-day avg: above +10 / in line with +5 / below +0
-Earnings (10): earnings within 5 trading days +0, within 6-10 +5, else +10
-Location (30): near support (<=3% +15 / <=6% +10 / <=10% +5), room below resistance (>=8% +5 / >=5% +3), reward:risk (>=4 +10 / >=3 +8 / >=2.5 +5)
-Two-stage gate: Stage 1 rejects anything below 45/55 on Trend+Momentum+Earnings alone. Stage 2 (of what's left) rejects reward:risk below 2.5. Survivors are ranked by total score out of 85 (Location included).
+    body = f"""{report_label} - {datetime.now().strftime('%A, %d %B %Y')}
 
-{watchlist_table}
+Generated: {datetime.now().strftime('%d %b %Y, %H:%M')} (server time)
+{price_data_line}
+{premarket_freshness_line}
 
-CHANGES TODAY
-{changes_text}
+====================================================
+1. DECISION SUMMARY
+====================================================
+{decision_summary}
 
---------------------------------------------------
-SUPPORT / RESISTANCE & REWARD:RISK (sorted best R:R first)
---------------------------------------------------
-Support/resistance = nearest confirmed pivot low/high in the last 60 sessions.
-Stop = support minus a 0.5% buffer. Target = nearest resistance. R:R = reward / risk.
-"n/a" means no confirmed pivot was found on that side within the lookback window.
+====================================================
+2. PORTFOLIO ACTIONS
+====================================================
+Current holdings: {len(holdings)}
+Portfolio actions required: {portfolio_action_count}
 
-{levels_table}
+{holdings_section}
 
---------------------------------------------------
-TRADE PLAN (position sizing on shortlisted names)
---------------------------------------------------
-Assumes portfolio value ${trade_settings['portfolio_value']:,.0f}, max risk per trade
-{trade_settings['max_risk_pct']*100:.1f}% (${trade_settings['portfolio_value']*trade_settings['max_risk_pct']:,.2f}),
-max position size {trade_settings['max_position_pct']*100:.1f}% (${trade_settings['portfolio_value']*trade_settings['max_position_pct']:,.2f}).
-Adjust these in portfolio.json under "trade_settings". Shares = the smaller of
-(risk cap / risk per share) and (position cap / entry price), rounded down.
+====================================================
+3. NEW TRADE CANDIDATES
+====================================================
+Qualification: base score >= {BASE_SCORE_MINIMUM}/55 and reward:risk >= {REWARD_RISK_MINIMUM}x. Full methodology in the repo README.
 
+{candidates_summary}
+
+--- Fixed-buffer sizing ---
 {trade_plan_table}
 
---------------------------------------------------
-ATR-BASED TRADE PLAN (volatility-adjusted stop, alternative to the fixed-buffer plan above)
---------------------------------------------------
-Entry = latest close. Stop = nearest pivot support minus 0.75x ATR(14) (instead
-of a fixed 0.5% buffer). Target = nearest pivot resistance.
-Status: CANDIDATE = R:R >= 3 and passes sizing | WATCH = R:R 2.5-3 | PASS = R:R < 2.5,
-position rounds to 0 shares, or no usable support/resistance was found.
-
+--- ATR-based sizing (volatility-adjusted stop-loss) ---
 {atr_trade_plan_table}
 
---------------------------------------------------
-EXIT PLAN - MULTI-TARGET SCALE-OUT (per shortlisted ticker)
---------------------------------------------------
-For each ticker with a valid ATR trade plan: up to three exit targets from
-independent sources (a volatility-based ATR extension, the nearest chart
-resistance, and a longer-term "major" resistance for a partial runner
-position), each scored 0-100 on reward:risk, structure alignment, RSI,
-volume, and earnings timing. Near-duplicate targets are merged, keeping the
-higher-scored one. The PRIMARY TARGET is the highest-scored candidate among
-those clearing a 2.5 reward:risk floor - if none clear it, no primary target
-is shown (status: NO_TARGET_MEETS_MINIMUM_RR) rather than falling back to a
-weaker one. Shares are split 30% / 40% / runner across target 1, target 2,
-and whatever's left (70% / runner if only one target exists).
-
+--- Exit plan (multi-target scale-out) ---
 {exit_plan_section}
 
---------------------------------------------------
-PRE-MARKET GAP CHECK (shortlisted names only)
---------------------------------------------------
-gap % = (pre-market price - previous close) / previous close x 100
-<1% gap: OK - plan unchanged | 1-3%: Recalculate entry/RR | >3%: Review manually - large gap
+--- Support / resistance detail ---
+{levels_table}
 
-{premarket_table}
+====================================================
+4. REJECTED / WATCH NAMES
+====================================================
+Stage 1 passed: {len(stage1_shortlist)}
+Rejected on reward:risk: {len(stage2_eliminated)}
+Final candidates: {len(watchlist_us)}
 
-Why the significant gaps happened:
-{premarket_explanations}
+Closest reward:risk rejects:
+{rejects_lines}
+
+Changes today:
+{changes_text}
+
+====================================================
+5. MARKET AND PRE-MARKET VALIDATION
+====================================================
+{premarket_section}
+
+====================================================
+6. DATA-QUALITY ALERTS
+====================================================
+{data_quality_text}
 
 --------------------------------------------------
 This is an automated research note, not financial advice. Data may be delayed
@@ -1868,7 +2085,7 @@ or incomplete; verify anything before acting on it.
     print(body)
 
     if os.environ.get("EMAIL_ADDRESS"):
-        send_email(f"Daily Stock Note - {datetime.now().strftime('%Y-%m-%d')}", body)
+        send_email(f"{report_label.title()} - {datetime.now().strftime('%Y-%m-%d')}", body)
         print("\nEmail sent.")
     else:
         print("\nEMAIL_ADDRESS not set - skipped sending email.")
