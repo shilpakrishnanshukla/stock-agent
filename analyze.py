@@ -44,6 +44,7 @@ import anthropic
 
 from gdrive_sync import download_workbook, upload_workbook
 from trade_planner_writer import update_trade_planner
+from trade_journal_reader import read_holdings_from_trade_journal
 
 PORTFOLIO_FILE = "portfolio.json"
 MODEL = "claude-sonnet-4-6"
@@ -1729,8 +1730,13 @@ def humanize_exception(context, e):
     elif "total_shares must be positive" in msg:
         clean = "Position size resolved to zero shares."
     else:
-        clean = "An internal calculation error occurred."
-    print(f"[data-quality] {context}: {msg}")  # raw detail goes to the log only
+        # Unrecognized error type - still print the raw detail to the log,
+        # but also surface a short version in the email instead of a
+        # content-free generic phrase, so a new/unexpected failure mode
+        # (e.g. auth, config, network) doesn't require a log dig every time.
+        short_msg = msg if len(msg) <= 160 else msg[:157] + "..."
+        clean = f"Unexpected error ({type(e).__name__}): {short_msg}"
+    print(f"[data-quality] {context}: {msg}")  # full raw detail always goes to the log too
     return clean
 
 
@@ -1976,11 +1982,26 @@ def send_email(subject, body):
 
 def main():
     portfolio = load_portfolio()
-    holdings = portfolio.get("holdings", [])
     watchlist_us = portfolio.get("watchlist_us", [])
-    holdings_tickers = [h["ticker"] for h in holdings]
     weekend = is_weekend()
     data_quality_alerts = []
+
+    # --- Holdings: Trade Journal (Excel, via Drive) is the source of truth.
+    #     portfolio.json's "holdings" list is only used as a fallback if the
+    #     Drive read fails, so the pipeline still runs on a bad network day. ---
+    holdings = portfolio.get("holdings", [])
+    try:
+        download_workbook(TRADE_PLANNER_LOCAL)
+        journal_holdings = read_holdings_from_trade_journal(TRADE_PLANNER_LOCAL, market=TRADE_PLANNER_MARKET)
+        holdings = journal_holdings
+        portfolio["holdings"] = journal_holdings  # keep the fallback cache fresh for the next run
+    except Exception as e:
+        clean = humanize_exception("Trade Journal holdings read", e)
+        data_quality_alerts.append(
+            f"Trade Journal holdings read failed, using portfolio.json holdings as fallback - {clean}"
+        )
+
+    holdings_tickers = [h["ticker"] for h in holdings]
 
     # --- Holdings: live price + qualitative hold/sell read ---
     snapshots = {h["ticker"]: fetch_snapshot(h["ticker"]) for h in holdings}
