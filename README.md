@@ -170,6 +170,62 @@ This is a sizing calculation based on the stop/target already derived from
 technical levels, not a recommendation of how much you personally should
 risk - adjust the percentages to whatever you're actually comfortable with.
 
+## ATR-based trade plan (second, alternative sizing)
+
+A second trade plan runs alongside the one above, using a **volatility-
+adjusted stop** instead of a fixed 0.5% buffer below support:
+
+- **ATR(14)** (Average True Range, Wilder-smoothed) measures how much a
+  stock typically moves per day
+- **Stop** = nearest pivot support minus 0.75x ATR - so a stock that
+  normally swings $3/day gets more breathing room than one that swings
+  $0.30/day, rather than both getting the same flat percentage
+- **Target** = nearest pivot resistance, same as before
+- Each ticker gets a **status**: `CANDIDATE` (R:R >= 3 and sizing works),
+  `WATCH` (R:R between 2.5 and 3), or `PASS` (R:R below 2.5, position
+  rounds to 0 shares, or no usable support/resistance was found nearby)
+
+This is shown as a separate table alongside the original trade plan - not a
+replacement - so you can compare a fixed-buffer stop against a volatility-
+adjusted one side by side. Both use the same `trade_settings` from
+`portfolio.json`.
+
+## Exit plan - multi-target scale-out
+
+For every ticker with a valid ATR trade plan, a further section plans **how
+to sell**, not just where to buy - since a single fixed target rarely
+matches how a real position gets managed.
+
+Up to three exit targets are built from independent sources:
+
+- **ATR extension** (3x ATR above entry) - a volatility-based stretch target
+  that doesn't depend on chart structure at all
+- **Nearest resistance** - the closest confirmed pivot high within the last
+  60 sessions, the first likely area of selling pressure
+- **Major resistance** - the highest confirmed pivot high within the last
+  ~250 sessions (roughly a year) that's meaningfully higher than the
+  nearest one (at least 1% further out, so it isn't just a near-duplicate) -
+  a stretch target for a partial "runner" position
+
+Each candidate is **scored out of 100** across five factors: reward:risk (up
+to 30), how closely it aligns with actual chart structure vs. being a pure
+volatility projection (up to 30), RSI (up to 15), relative volume (up to
+15), and earnings timing (+10 if clear, -15 penalty if earnings fall within
+5 trading days). Near-duplicate targets (within 0.25x ATR of each other) are
+merged, keeping whichever scored higher.
+
+The **PRIMARY TARGET** is the highest-scored candidate among those that
+clear a 2.5 reward:risk floor. If nothing clears that floor, **no primary
+target is shown** - the plan reports status `NO_TARGET_MEETS_MINIMUM_RR`
+rather than quietly settling for a weaker one. This is a real behavior
+worth knowing: unlike some of the other sections in this tool, there's no
+fallback here - "no good exit target found today" is a valid, visible
+outcome.
+
+Shares are allocated with a fixed scheme: **30% at target 1, 40% at target
+2, the remainder as a runner** (or 70% at target 1 / 30% runner if only one
+target candidate exists).
+
 ## SG (SGX) watchlist - separate daily email at 8:30am SGT
 
 A second script, `analyze_sg.py`, runs the exact same scoring engine
