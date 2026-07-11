@@ -1,5 +1,11 @@
 {
-  "holdings": [],
+  "holdings": [
+    {
+      "ticker": "SKHYV",
+      "shares": 3,
+      "cost_basis": 168.0
+    }
+  ],
   "watchlist_us": [
     "CRWD"
   ],
