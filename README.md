@@ -56,9 +56,96 @@ Edit `portfolio.json` directly and commit the change (GitHub's web editor works
 fine for this, no need for git on your machine):
 
 - **New buy**: add an object to `holdings` with `ticker`, `shares`, `cost_basis`
-  (your actual purchase price), and `date_bought`.
+  (your actual purchase price), and `date_bought` (format `"YYYY-MM-DD"`).
+  **`date_bought` is now needed** to get rules-based trade management for
+  that position (see below) - without it, that section just shows a plain
+  note that it's unavailable for that ticker, nothing else breaks.
 - **Sell**: remove it from `holdings` and add it to `closed_positions` with
   `sold_price` and `date_sold`, so you keep a record.
+
+## Rules-based trade management (for actual holdings)
+
+Everything else in this tool scores and sizes a trade *before* you buy it.
+This section manages a position *after* you've bought it - a bar-by-bar
+simulation from your real entry date to today, using ATR-based stops,
+staged profit-taking, break-even, and a trailing stop. It's the closest
+thing here to "here's exactly what to do with what you're already holding."
+
+For each holding with a `date_bought`, using your `cost_basis` as the entry
+price:
+
+- **Soft stop**: 1.5x ATR(14) below entry (or a nearby structural support
+  level if one's lower, giving it more room)
+- **Emergency stop**: 2.5x ATR below entry (always kept below the soft
+  stop) - triggers an immediate full exit if intraday price ever trades
+  through it, no confirmation needed
+- **Warning levels**: at 0.75x and 1.25x ATR below entry, flagged in the
+  daily read as early signs of weakness before any stop is actually hit
+- **Three profit targets**, in units of initial risk (1R, 2R, 3R) - each
+  sells 25% of the original position, leaving a 25% runner
+- **Break-even stop**: once price reaches 1R, the stop moves up to just
+  above entry, so a full round-trip back to a loss isn't possible after that
+- **ATR trailing stop**: once price reaches 2R, the stop starts trailing
+  2x ATR below the highest price reached, locking in more of the gain as
+  it runs
+- **Wick tolerance**: a single bar that dips below the stop intraday but
+  closes back above it doesn't trigger an exit - only 2 consecutive
+  *closes* below the active stop confirm a real breakdown, to avoid being
+  shaken out by one noisy bar
+
+Each day's email shows, per holding, a structured block rather than one
+dense line:
+
+```
+AAPL
+BUY STATUS
+  New Buy
+> Existing Position
+  No Position
+--------------------------------
+PROFIT
+Current Gain: 11.11%
+Current R: 0.72
+Highest R: 1.03
+--------------------------------
+PROTECTION
+Emergency Stop: 177.02
+Soft Stop: 178.21
+Current ATR Stop: 178.21
+Break-even Level: 180.09
+--------------------------------
+ACTION
+SELL 25%
+--------------------------------
+WHY?
+Price reached target 1 (112.79, 1R) - scaling out 25% per plan.
+```
+
+**BUY STATUS**: which of New Buy / Existing Position / No Position applies
+(the `>` marks the current one) - New Buy means today's report is the
+first one since entry.
+
+**PROFIT**: current gain in %, current R-multiple (based on today's close),
+and the highest R-multiple reached at any point since entry (these two can
+differ once price has pulled back from a high).
+
+**PROTECTION**: all four protective levels at once - the emergency stop,
+the soft stop, whichever stop is *currently* active (which may have moved
+to break-even or be trailing), and the break-even level itself.
+
+**ACTION**: exactly one of `HOLD`, `SELL 25%`, `MOVE STOP`, or `EXIT` -
+today's single resolved action, not a log of everything that's happened
+since entry.
+
+**WHY?**: one plain-English sentence for that action - e.g. "Price closed
+below support" or "Second confirmation received" - translated from the
+engine's internal trigger, not a raw rule dump.
+
+This runs independently of - and alongside - the qualitative Hold/Trim/Sell
+read Claude already gives each holding; one is a fixed rules engine, the
+other is closer to a human-style read of the news. They can and sometimes
+will disagree with each other, which is fine - they're answering slightly
+different questions.
 
 ## The daily report is now decision-first
 
