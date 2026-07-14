@@ -9,6 +9,11 @@
       "ticker": "GOOG",
       "shares": 1,
       "cost_basis": 352.34
+    },
+    {
+      "ticker": "SNDK",
+      "shares": 1,
+      "cost_basis": 1684.0
     }
   ],
   "watchlist_us": [],
