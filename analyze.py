@@ -42,9 +42,15 @@ import pandas as pd
 import numpy as np
 import anthropic
 
+from gdrive_sync import download_workbook, upload_workbook
+from trade_planner_writer import update_trade_planner
+from trade_journal_reader import read_holdings_from_trade_journal
+
 PORTFOLIO_FILE = "portfolio.json"
 MODEL = "claude-sonnet-4-6"
 WATCHLIST_MAX_US = 15
+TRADE_PLANNER_LOCAL = "trade_planner_temp.xlsx"
+TRADE_PLANNER_MARKET = "US"
 
 # A broad, liquid US candidate universe to screen daily for the watchlist.
 # Not an exhaustive S&P 500 list, but a representative, liquid cross-section
@@ -1117,515 +1123,6 @@ def build_exit_plan(
     }
 
 
-# ---------------------------------------------------------------------------
-# Post-entry trade management: bar-by-bar simulation for actual holdings
-# (distinct from the pre-entry scoring/sizing above - this manages a
-# position after it's already been bought, given its real entry date/price)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TradeConfig:
-    # ATR settings
-    atr_period: int = 14
-
-    # Stop placement
-    soft_stop_atr: float = 1.5
-    emergency_stop_atr: float = 2.5
-    structure_buffer_atr: float = 0.15
-
-    # Warning levels, measured from entry
-    warning_1_atr: float = 0.75
-    warning_2_atr: float = 1.25
-
-    # Require this many consecutive closes below the soft stop
-    stop_confirmation_bars: int = 2
-
-    # Profit targets, expressed in units of initial risk
-    target_1_r: float = 1.0
-    target_2_r: float = 2.0
-    target_3_r: float = 3.0
-
-    # Percentage of original position sold at each target
-    target_1_sell_pct: float = 0.25
-    target_2_sell_pct: float = 0.25
-    target_3_sell_pct: float = 0.25
-
-    # Break-even rules
-    breakeven_trigger_r: float = 1.0
-    breakeven_buffer_r: float = 0.05
-
-    # Trailing-stop rules
-    trailing_trigger_r: float = 2.0
-    trailing_atr_multiple: float = 2.0
-
-    # Exit protection
-    # Exit immediately when price trades below the emergency stop.
-    use_hard_emergency_stop: bool = True
-
-    # Normal soft/trailing stops use closes rather than intraday lows.
-    use_close_confirmation: bool = True
-
-
-def calculate_atr(data: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Calculate Wilder's Average True Range.
-
-    Required columns:
-        High, Low, Close
-    """
-    required = {"High", "Low", "Close"}
-    missing = required - set(data.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {sorted(missing)}")
-
-    previous_close = data["Close"].shift(1)
-
-    true_range = pd.concat(
-        [
-            data["High"] - data["Low"],
-            (data["High"] - previous_close).abs(),
-            (data["Low"] - previous_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    # Wilder smoothing is equivalent to EMA with alpha = 1 / period.
-    atr = true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    return atr
-
-
-def create_trade_levels(
-    entry_price: float,
-    entry_atr: float,
-    config: TradeConfig,
-    structure_low: Optional[float] = None,
-) -> dict:
-    """
-    Create the initial stop, warning and target levels.
-
-    structure_low:
-        Optional recent swing low or support level.
-    """
-    if entry_price <= 0:
-        raise ValueError("entry_price must be positive.")
-
-    if entry_atr <= 0 or np.isnan(entry_atr):
-        raise ValueError("entry_atr must be a valid positive number.")
-
-    volatility_soft_stop = entry_price - config.soft_stop_atr * entry_atr
-    emergency_stop = entry_price - config.emergency_stop_atr * entry_atr
-
-    if structure_low is not None:
-        structure_stop = structure_low - config.structure_buffer_atr * entry_atr
-        # Use the lower stop so normal volatility and the structure
-        # level both receive room.
-        soft_stop = min(volatility_soft_stop, structure_stop)
-    else:
-        soft_stop = volatility_soft_stop
-
-    # The emergency stop should always be below the soft stop.
-    emergency_stop = min(emergency_stop, soft_stop - 0.25 * entry_atr)
-
-    initial_risk = entry_price - soft_stop
-    if initial_risk <= 0:
-        raise ValueError("The calculated soft stop must be below the entry price.")
-
-    return {
-        "entry": entry_price,
-        "entry_atr": entry_atr,
-        "warning_1": entry_price - config.warning_1_atr * entry_atr,
-        "warning_2": entry_price - config.warning_2_atr * entry_atr,
-        "soft_stop": soft_stop,
-        "emergency_stop": emergency_stop,
-        "initial_risk": initial_risk,
-        "target_1": entry_price + config.target_1_r * initial_risk,
-        "target_2": entry_price + config.target_2_r * initial_risk,
-        "target_3": entry_price + config.target_3_r * initial_risk,
-        "breakeven_stop": entry_price + config.breakeven_buffer_r * initial_risk,
-    }
-
-
-def run_trade_manager(
-    data: pd.DataFrame,
-    entry_index,
-    entry_price: Optional[float] = None,
-    structure_low: Optional[float] = None,
-    config: Optional[TradeConfig] = None,
-):
-    """
-    Manage a long swing trade bar by bar.
-
-    Parameters
-    ----------
-    data:
-        DataFrame indexed by datetime with:
-        Open, High, Low, Close
-
-        Volume is optional.
-
-    entry_index:
-        Index label of the entry bar.
-
-    entry_price:
-        Actual fill price. If omitted, entry bar Close is used.
-
-    structure_low:
-        Optional recent swing low/support level.
-
-    Returns
-    -------
-    results:
-        Bar-by-bar trade management output.
-
-    levels:
-        Initial trade levels.
-    """
-    if config is None:
-        config = TradeConfig()
-
-    prices = data.copy().sort_index()
-
-    required = {"Open", "High", "Low", "Close"}
-    missing = required - set(prices.columns)
-    if missing:
-        raise ValueError(f"Missing columns: {sorted(missing)}")
-
-    if entry_index not in prices.index:
-        raise KeyError("entry_index is not present in the DataFrame.")
-
-    prices["ATR"] = calculate_atr(prices, period=config.atr_period)
-
-    entry_atr = float(prices.loc[entry_index, "ATR"])
-    if np.isnan(entry_atr):
-        raise ValueError(
-            "ATR is unavailable at the entry bar. "
-            "Provide more historical data before the entry date."
-        )
-
-    if entry_price is None:
-        entry_price = float(prices.loc[entry_index, "Close"])
-
-    levels = create_trade_levels(
-        entry_price=entry_price,
-        entry_atr=entry_atr,
-        config=config,
-        structure_low=structure_low,
-    )
-
-    trade_data = prices.loc[entry_index:].copy()
-
-    remaining_position = 1.0
-    highest_price = entry_price
-
-    target_1_hit = False
-    target_2_hit = False
-    target_3_hit = False
-    breakeven_active = False
-    trailing_active = False
-    trade_closed = False
-
-    consecutive_closes_below_stop = 0
-    active_stop = levels["soft_stop"]
-
-    output_rows = []
-
-    for timestamp, row in trade_data.iterrows():
-        high = float(row["High"])
-        low = float(row["Low"])
-        close = float(row["Close"])
-        current_atr = float(row["ATR"])
-
-        highest_price = max(highest_price, high)
-
-        actions = []
-        exit_reason = None
-        wick_below_stop_recovered = False
-
-        # ---------------------------------------------
-        # 1. Emergency stop: immediate catastrophic exit
-        # ---------------------------------------------
-        if (
-            not trade_closed
-            and config.use_hard_emergency_stop
-            and low <= levels["emergency_stop"]
-        ):
-            actions.append("EXIT 100%: emergency stop hit")
-            exit_reason = "Emergency stop"
-            remaining_position = 0.0
-            trade_closed = True
-
-        # ---------------------------------------------
-        # 2. Profit-target scale-outs
-        # ---------------------------------------------
-        if not trade_closed:
-            if high >= levels["target_1"] and not target_1_hit:
-                sell_amount = min(config.target_1_sell_pct, remaining_position)
-                remaining_position -= sell_amount
-                target_1_hit = True
-                actions.append(f"SELL {sell_amount:.0%}: target 1 reached")
-
-            if high >= levels["target_2"] and not target_2_hit:
-                sell_amount = min(config.target_2_sell_pct, remaining_position)
-                remaining_position -= sell_amount
-                target_2_hit = True
-                actions.append(f"SELL {sell_amount:.0%}: target 2 reached")
-
-            if high >= levels["target_3"] and not target_3_hit:
-                sell_amount = min(config.target_3_sell_pct, remaining_position)
-                remaining_position -= sell_amount
-                target_3_hit = True
-                actions.append(f"SELL {sell_amount:.0%}: target 3 reached")
-
-        current_r = (highest_price - levels["entry"]) / levels["initial_risk"]
-
-        # ---------------------------------------------
-        # 3. Move stop to break-even
-        # ---------------------------------------------
-        if (
-            not trade_closed
-            and not breakeven_active
-            and current_r >= config.breakeven_trigger_r
-        ):
-            breakeven_active = True
-            active_stop = max(active_stop, levels["breakeven_stop"])
-            actions.append(f"Move stop to break-even: {active_stop:.2f}")
-
-        # ---------------------------------------------
-        # 4. Activate ATR trailing stop
-        # ---------------------------------------------
-        if not trade_closed and current_r >= config.trailing_trigger_r:
-            if not trailing_active:
-                actions.append("Activate ATR trailing stop")
-            trailing_active = True
-
-            if not np.isnan(current_atr):
-                proposed_trailing_stop = (
-                    highest_price - config.trailing_atr_multiple * current_atr
-                )
-                # Stop can only move upward for a long position.
-                active_stop = max(active_stop, proposed_trailing_stop)
-
-        # ---------------------------------------------
-        # 5. Warning levels
-        # ---------------------------------------------
-        if not trade_closed:
-            if close < levels["warning_2"]:
-                actions.append("WARNING 2: deep weakness; review setup")
-            elif close < levels["warning_1"]:
-                actions.append("WARNING 1: normal-to-moderate pullback")
-
-        # ---------------------------------------------
-        # 6. Brief wick versus confirmed breakdown
-        # ---------------------------------------------
-        if not trade_closed:
-            if low < active_stop and close >= active_stop:
-                wick_below_stop_recovered = True
-                actions.append(
-                    "IGNORE WICK: price dipped below stop but recovered by bar close"
-                )
-                # A recovered wick resets the confirmation count.
-                consecutive_closes_below_stop = 0
-            elif close < active_stop:
-                consecutive_closes_below_stop += 1
-                actions.append(
-                    "Close below active stop: "
-                    f"{consecutive_closes_below_stop}/{config.stop_confirmation_bars}"
-                )
-                if (
-                    not config.use_close_confirmation
-                    or consecutive_closes_below_stop >= config.stop_confirmation_bars
-                ):
-                    actions.append("EXIT REMAINDER: stop breakdown confirmed")
-                    exit_reason = "Confirmed close below active stop"
-                    remaining_position = 0.0
-                    trade_closed = True
-            else:
-                consecutive_closes_below_stop = 0
-
-        # Sell remaining shares at target 3 if desired.
-        # In this configuration, 25% remains as a runner.
-        if remaining_position <= 0:
-            remaining_position = 0.0
-            trade_closed = True
-
-        output_rows.append(
-            {
-                "Date": timestamp,
-                "Close": close,
-                "ATR": current_atr,
-                "Highest_Price": highest_price,
-                "R_Multiple_Reached": current_r,
-                "Active_Stop": active_stop,
-                "Remaining_Position": remaining_position,
-                "Target_1_Hit": target_1_hit,
-                "Target_2_Hit": target_2_hit,
-                "Target_3_Hit": target_3_hit,
-                "Breakeven_Active": breakeven_active,
-                "Trailing_Stop_Active": trailing_active,
-                "Recovered_Wick": wick_below_stop_recovered,
-                "Action": " | ".join(actions) if actions else "HOLD",
-                "Exit_Reason": exit_reason,
-            }
-        )
-
-        if trade_closed:
-            break
-
-    results = pd.DataFrame(output_rows).set_index("Date")
-    return results, levels
-
-
-def run_holding_trade_management(ticker, cost_basis, date_bought):
-    """Fetches price history from just before the entry date through today
-    and runs the bar-by-bar trade manager, returning (result_dict_or_None,
-    clean_error_or_None). Needs date_bought - without a real entry date
-    there's no bar to start simulating from."""
-    if not date_bought:
-        return None, "no date_bought recorded - add one to enable trade management"
-
-    try:
-        target_date = pd.Timestamp(date_bought)
-    except Exception:
-        return None, f"date_bought '{date_bought}' could not be parsed"
-
-    try:
-        fetch_start = (target_date - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
-        df = yf.download(tickers=ticker, start=fetch_start, interval="1d", progress=False, auto_adjust=False)
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        if df is None or df.empty:
-            return None, "no price history available"
-
-        candidates = df.index[df.index >= target_date]
-        if candidates.empty:
-            return None, "date_bought is after the most recent available trading data"
-        entry_index = candidates[0]
-
-        results, levels = run_trade_manager(df, entry_index=entry_index, entry_price=cost_basis)
-        return {"results": results, "levels": levels}, None
-    except Exception as e:
-        clean = humanize_exception(f"{ticker} trade management", e)
-        return None, clean
-
-
-def summarize_trade_management(ticker, shares, mgmt_result):
-    """Distills the bar-by-bar simulation's last row into the categories
-    the daily report shows: buy status, profit metrics, protective levels,
-    one resolved action, and a plain-English reason for that action."""
-    if shares is not None and shares <= 0:
-        return {"ticker": ticker, "buy_status": "No Position", "unavailable": True}
-
-    results = mgmt_result["results"]
-    levels = mgmt_result["levels"]
-    last = results.iloc[-1]
-    entry = levels["entry"]
-    close = float(last["Close"])
-
-    current_gain_pct = (close - entry) / entry * 100
-    current_r = (close - entry) / levels["initial_risk"]
-    highest_r = float(last["R_Multiple_Reached"])
-
-    # "New Buy" = today's report is the first one since entry (no bars have
-    # elapsed yet); anything with prior history is an existing position.
-    buy_status = "New Buy" if len(results) <= 1 else "Existing Position"
-
-    action_str = last["Action"]
-    exit_reason = last["Exit_Reason"]
-
-    if exit_reason:
-        primary_action = "EXIT"
-        if exit_reason == "Emergency stop":
-            why = "Emergency stop breached intraday - immediate protective exit triggered."
-        else:
-            confirm_part = next((p for p in action_str.split(" | ") if "Close below active stop" in p), "")
-            why = f"Price closed below the active stop. {confirm_part.strip()} - confirmation reached, trend structure broken."
-    elif "SELL" in action_str:
-        primary_action = "SELL 25%"
-        if "target 1" in action_str:
-            why = f"Price reached target 1 ({levels['target_1']:.2f}, 1R) - scaling out 25% per plan."
-        elif "target 2" in action_str:
-            why = f"Price reached target 2 ({levels['target_2']:.2f}, 2R) - scaling out another 25%."
-        elif "target 3" in action_str:
-            why = f"Price reached target 3 ({levels['target_3']:.2f}, 3R) - scaling out another 25%, 25% runner remains."
-        else:
-            why = "Profit target reached - scaling out per plan."
-    elif "break-even" in action_str or "trailing stop" in action_str.lower():
-        primary_action = "MOVE STOP"
-        if "break-even" in action_str:
-            why = f"Position reached the break-even trigger ({levels['entry']:.2f} entry) - stop moved up to lock it in."
-        else:
-            why = "Position reached the trailing-stop trigger - stop now trails price using ATR."
-    elif "WARNING 2" in action_str:
-        primary_action = "HOLD"
-        why = "Momentum weakening - price closed below the deeper warning level. No stop breached yet; watch closely."
-    elif "WARNING 1" in action_str:
-        primary_action = "HOLD"
-        why = "Normal-to-moderate pullback - price closed below the first warning level. No action needed yet."
-    elif "IGNORE WICK" in action_str:
-        primary_action = "HOLD"
-        why = "Price dipped below the stop intraday but closed back above it - no confirmed breakdown."
-    elif "Close below active stop" in action_str:
-        primary_action = "HOLD"
-        confirm_part = action_str.split(":")[-1].strip() if ":" in action_str else ""
-        why = f"Price closed below support ({confirm_part} confirmation) - one more confirmed close would trigger an exit."
-    else:
-        primary_action = "HOLD"
-        why = "No new signal today - position holding within normal range."
-
-    return {
-        "ticker": ticker,
-        "buy_status": buy_status,
-        "current_gain_pct": round(current_gain_pct, 2),
-        "current_r": round(current_r, 2),
-        "highest_r": round(highest_r, 2),
-        "emergency_stop": round(levels["emergency_stop"], 2),
-        "soft_stop": round(levels["soft_stop"], 2),
-        "current_atr_stop": round(float(last["Active_Stop"]), 2),
-        "breakeven_level": round(levels["breakeven_stop"], 2),
-        "action": primary_action,
-        "why": why,
-        "unavailable": False,
-    }
-
-
-def format_trade_management_block(ticker, shares, mgmt_result, error):
-    if error or not mgmt_result:
-        reason = error or "unavailable"
-        return f"{ticker}\nBUY STATUS: unavailable - {reason}\n"
-
-    s = summarize_trade_management(ticker, shares, mgmt_result)
-    if s.get("unavailable"):
-        return f"{ticker}\nBUY STATUS: {s['buy_status']}\n"
-
-    buy_status_options = ["New Buy", "Existing Position", "No Position"]
-    buy_status_lines = "\n".join(
-        f"{'>' if opt == s['buy_status'] else ' '} {opt}" for opt in buy_status_options
-    )
-
-    return f"""{ticker}
-BUY STATUS
-{buy_status_lines}
---------------------------------
-PROFIT
-Current Gain: {s['current_gain_pct']}%
-Current R: {s['current_r']}
-Highest R: {s['highest_r']}
---------------------------------
-PROTECTION
-Emergency Stop: {s['emergency_stop']}
-Soft Stop: {s['soft_stop']}
-Current ATR Stop: {s['current_atr_stop']}
-Break-even Level: {s['breakeven_level']}
---------------------------------
-ACTION
-{s['action']}
---------------------------------
-WHY?
-{s['why']}
-"""
-
-
-
-
 def build_atr_trade_plan(
     df: pd.DataFrame,
     ticker: str,
@@ -2387,6 +1884,86 @@ def format_exit_plan_section(watchlist, atr_plans):
     return "\n\n".join(blocks)
 
 
+# ---------------------------------------------------------------------------
+# Trade Planner (Google Drive) sync
+# ---------------------------------------------------------------------------
+
+def infer_setup_type(ind):
+    """Rough, best-effort label for the Trade Planner's 'Setup Type' column,
+    derived from data the screen already computes. Not a rigorous
+    classification - feel free to hand-edit this column after the fact;
+    the writer never overwrites a row it didn't just create."""
+    if not ind:
+        return "Screen Candidate"
+    if ind.get("higher_highs") and ind.get("higher_lows"):
+        return "Trend Continuation"
+    price = ind.get("price")
+    support = ind.get("nearest_support")
+    if price is not None and support is not None and price <= support * 1.03:
+        return "Pullback to Support"
+    return "Momentum"
+
+
+def build_trade_planner_candidates(watchlist, indicators, scores, trade_plans, atr_trade_plans):
+    """Converts today's final watchlist into the dict shape
+    trade_planner_writer.update_trade_planner() expects. Company name isn't
+    available anywhere in this pipeline (only tickers), so it's left equal
+    to the ticker - fill it in by hand in the sheet, or tell me and I'll
+    add a ticker->company lookup table."""
+    candidates = []
+    for ticker in watchlist:
+        ind = indicators.get(ticker) or {}
+        s = scores.get(ticker) or {}
+        fixed_plan = trade_plans.get(ticker) or {}
+        atr_plan = atr_trade_plans.get(ticker) or {}
+        rr = ind.get("reward_risk") or {}
+
+        entry = fixed_plan.get("entry") or atr_plan.get("entry") or ind.get("price")
+        stop = atr_plan.get("stop_loss") or fixed_plan.get("stop_loss") or rr.get("stop")
+        target = fixed_plan.get("target_sell") or rr.get("target")
+
+        exec_status = get_execution_status(ticker, trade_plans, atr_trade_plans)
+        status = "Pass" if exec_status == "Ready" else "Watch"
+
+        candidates.append({
+            "ticker": ticker,
+            "company": ticker,
+            "market": TRADE_PLANNER_MARKET,
+            "setup_type": infer_setup_type(ind),
+            "trend_score": s.get("trend"),
+            "momentum_score": s.get("momentum"),
+            "earnings_score": s.get("earnings"),
+            "location_score": s.get("location"),
+            "entry": entry,
+            "support": ind.get("nearest_support"),
+            "atr": atr_plan.get("atr"),
+            "stop": stop,
+            "resistance": ind.get("nearest_resistance"),
+            "target": target,
+            "status": status,
+            "notes": f"Auto-added by daily pipeline - {datetime.now().strftime('%Y-%m-%d')} - Execution: {exec_status}",
+        })
+    return candidates
+
+
+def sync_trade_planner(watchlist, indicators, scores, trade_plans, atr_trade_plans):
+    """Downloads the Trade Planner workbook from Drive, appends any new
+    candidates below the last used row (never touching rows you've already
+    annotated), and re-uploads only if something was actually added.
+    Returns a clean, human-readable status string for the email; raises
+    nothing - callers should still wrap this in try/except for the
+    Data-Quality Alerts section, since Drive/network calls can fail."""
+    candidates = build_trade_planner_candidates(watchlist, indicators, scores, trade_plans, atr_trade_plans)
+    if not candidates:
+        return "No candidates today - Trade Planner not touched."
+    download_workbook(TRADE_PLANNER_LOCAL)
+    added = update_trade_planner(TRADE_PLANNER_LOCAL, candidates)
+    if added:
+        upload_workbook(TRADE_PLANNER_LOCAL)
+        return f"{added} new row(s) added to Trade Planner."
+    return "All of today's candidates were already in Trade Planner - nothing added."
+
+
 def send_email(subject, body):
     msg = MIMEText(body)
     msg["Subject"] = subject
@@ -2400,11 +1977,26 @@ def send_email(subject, body):
 
 def main():
     portfolio = load_portfolio()
-    holdings = portfolio.get("holdings", [])
     watchlist_us = portfolio.get("watchlist_us", [])
-    holdings_tickers = [h["ticker"] for h in holdings]
     weekend = is_weekend()
     data_quality_alerts = []
+
+    # --- Holdings: Trade Journal (Excel, via Drive) is the source of truth.
+    #     portfolio.json's "holdings" list is only used as a fallback if the
+    #     Drive read fails, so the pipeline still runs on a bad network day. ---
+    holdings = portfolio.get("holdings", [])
+    try:
+        download_workbook(TRADE_PLANNER_LOCAL)
+        journal_holdings = read_holdings_from_trade_journal(TRADE_PLANNER_LOCAL, market=TRADE_PLANNER_MARKET)
+        holdings = journal_holdings
+        portfolio["holdings"] = journal_holdings  # keep the fallback cache fresh for the next run
+    except Exception as e:
+        clean = humanize_exception("Trade Journal holdings read", e)
+        data_quality_alerts.append(
+            f"Trade Journal holdings read failed, using portfolio.json holdings as fallback - {clean}"
+        )
+
+    holdings_tickers = [h["ticker"] for h in holdings]
 
     # --- Holdings: live price + qualitative hold/sell read ---
     snapshots = {h["ticker"]: fetch_snapshot(h["ticker"]) for h in holdings}
@@ -2420,19 +2012,6 @@ def main():
         data_quality_alerts.append(f"Holdings analysis unavailable - {clean}")
 
     portfolio_action_count = sum(1 for v in verdicts.values() if v != "HOLD")
-
-    # --- Holdings: rules-based bar-by-bar trade management (needs date_bought) ---
-    trade_mgmt_blocks = []
-    for h in holdings:
-        mgmt_result, mgmt_error = run_holding_trade_management(
-            h["ticker"], h["cost_basis"], h.get("date_bought")
-        )
-        trade_mgmt_blocks.append(
-            format_trade_management_block(h["ticker"], h.get("shares"), mgmt_result, mgmt_error)
-        )
-        if mgmt_error and "no date_bought recorded" not in mgmt_error:
-            data_quality_alerts.append(f"{h['ticker']}: trade management unavailable - {mgmt_error}")
-    trade_management_text = "\n".join(trade_mgmt_blocks) if trade_mgmt_blocks else "(no holdings)"
 
     # --- Watchlist: auto-remove anything now actually owned ---
     auto_removed = [t for t in watchlist_us if t in holdings_tickers]
@@ -2477,6 +2056,16 @@ def main():
     data_quality_alerts += atr_alerts
     exit_plan_section = format_exit_plan_section(watchlist_us, atr_trade_plans)
     atr_trade_plan_table = format_atr_trade_plan_table(watchlist_us, atr_trade_plans)
+
+    # --- Trade Planner (Google Drive) sync: append-only, never blocks the email ---
+    try:
+        trade_planner_status = sync_trade_planner(
+            watchlist_us, indicators, scores, trade_plans, atr_trade_plans
+        )
+    except Exception as e:
+        clean = humanize_exception("Trade Planner sync", e)
+        trade_planner_status = f"Sync failed - {clean}"
+        data_quality_alerts.append(f"Trade Planner sync failed - {clean}")
 
     if weekend:
         premarket_section = "Not applicable - weekend, US market closed."
@@ -2565,9 +2154,6 @@ Portfolio actions required: {portfolio_action_count}
 
 {holdings_section}
 
---- Rules-based trade management (bar-by-bar, needs date_bought) ---
-{trade_management_text}
-
 ====================================================
 3. NEW TRADE CANDIDATES
 ====================================================
@@ -2586,6 +2172,9 @@ Qualification: base score >= {BASE_SCORE_MINIMUM}/55 and reward:risk >= {REWARD_
 
 --- Support / resistance detail ---
 {levels_table}
+
+--- Trade Planner (Google Sheet/Excel) sync ---
+{trade_planner_status}
 
 ====================================================
 4. REJECTED / WATCH NAMES
