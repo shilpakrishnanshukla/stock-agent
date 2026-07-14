@@ -52,37 +52,27 @@ WATCHLIST_MAX_US = 15
 TRADE_PLANNER_LOCAL = "trade_planner_temp.xlsx"
 TRADE_PLANNER_MARKET = "US"
 
-# A broad, liquid US candidate universe to screen daily for the watchlist.
-# Not an exhaustive S&P 500 list, but a representative, liquid cross-section
-# across sectors so the screen has enough breadth to find real candidates.
+# User-curated universe: exactly the tickers requested across sector
+# messages (Technology, Energy, Industrials, Materials & Mining,
+# Consumer/Travel, Healthcare, Oil Services, Gold & Precious Metals,
+# Uranium, Crypto Miners, Airlines, Cruise Lines, Casinos, Agriculture),
+# deduplicated. Replaces the earlier ~150-ticker generic large-cap list,
+# which was too broad/slow for a daily run.
 US_CANDIDATE_UNIVERSE = [
-    "AAPL","MSFT","NVDA","GOOGL","AMZN","META","AVGO","TSLA","AMD","CRM",
-    "ORCL","ADBE","INTC","QCOM","TXN","MU","AMAT","LRCX","KLAC","CSCO",
-    "IBM","NOW","PANW","SNPS","CDNS","INTU","FTNT","PLTR","UBER","ABNB",
-    "SHOP","NET","DDOG","SNOW","CRWD","ZS","MDB","TEAM","WDAY","ADSK",
-    "JPM","BAC","WFC","GS","MS","C","SCHW","BLK","AXP","V",
-    "MA","PYPL","SPGI","ICE","CME","BX","KKR","APO","COF","USB",
-    "UNH","JNJ","LLY","PFE","MRK","ABBV","TMO","ABT","DHR","BMY",
-    "AMGN","GILD","VRTX","REGN","ISRG","CVS","CI","HUM","MDT","SYK",
-    "XOM","CVX","COP","SLB","EOG","OXY","MPC","PSX","VLO",
-    "HD","LOW","MCD","SBUX","NKE","TJX","TGT","COST","WMT","PG",
-    "KO","PEP","PM","MO","CL","KMB","GIS","MDLZ","EL","STZ",
-    "BA","CAT","DE","HON","GE","RTX","LMT","NOC","GD","UPS",
-    "FDX","UNP","CSX","NSC","WM","ETN","EMR","ITW","PH","ROK",
-    "DIS","NFLX","CMCSA","T","VZ","TMUS","CHTR","WBD","EA","TTWO",
-    "LIN","APD","SHW","ECL","NEM","FCX","NUE","DOW","DD","PPG",
-    "NEE","DUK","SO","D","AEP","EXC","SRE","PCG","XEL","ED",
-    "PLD","AMT","EQIX","PSA","SPG","O","WELL","DLR","AVB","EQR",
-    # Added per user request - fills out Energy, Industrials, Materials/Mining,
-    # Consumer/Travel, Healthcare, and a couple of Tech names not already covered.
-    "SNDK","ARM",                     # Technology
-    "DVN","FANG","EQT",               # Energy
-    "URI",                            # Industrials
-    "CCJ","STLD",                     # Materials & Mining
-    "RCL","UAL","MGM","WYNN",         # Consumer/Travel
-    "MRNA","HCA",                     # Healthcare
+    "NVDA","AMD","CRWD","AMAT","SNDK","PLTR","ARM","AVGO",     # Technology
+    "XOM","CVX","OXY","DVN","FANG","EQT",                      # Energy
+    "SLB","HAL","BKR",                                          # Oil Services
+    "NEM","AEM","GOLD","WPM",                                   # Gold & Precious Metals
+    "CCJ","UEC","LEU",                                          # Uranium
+    "MARA","RIOT","CLSK",                                       # Crypto Miners
+    "DAL","UAL","AAL",                                          # Airlines
+    "CCL","RCL","NCLH",                                         # Cruise Lines
+    "LVS","MGM","WYNN",                                         # Casinos
+    "HCA","MRNA","VRTX","REGN",                                 # Healthcare/Biotech
+    "CAT","DE","URI",                                           # Industrials
+    "NUE","STLD","FCX","AA",                                    # Steel & Metals
+    "MOS","CF","NTR",                                           # Agriculture
 ]
-
 
 DEFAULT_TRADE_SETTINGS = {
     "portfolio_value": 10_000,
@@ -1262,6 +1252,18 @@ def compute_technical_indicators(tickers):
             ema50 = close.ewm(span=50, adjust=False).mean()
             rsi = compute_rsi(close, 14)
 
+            # ATR14 (Wilder) - reuses the High/Low/Close already fetched
+            # above, no extra network call. Needed for the full-universe
+            # snapshot table (ATR14 $ and ATR% columns).
+            previous_close = close.shift(1)
+            true_range = pd.concat([
+                df["High"] - df["Low"],
+                (df["High"] - previous_close).abs(),
+                (df["Low"] - previous_close).abs(),
+            ], axis=1).max(axis=1)
+            atr14_series = true_range.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+            latest_atr14 = float(atr14_series.iloc[-1]) if not pd.isna(atr14_series.iloc[-1]) else None
+
             avg_vol_20d = float(volume.tail(20).mean())
             latest_vol = float(volume.iloc[-1])
             latest_price = float(close.iloc[-1])
@@ -1280,6 +1282,8 @@ def compute_technical_indicators(tickers):
                 "ema20": round(float(ema20.iloc[-1]), 2),
                 "ema50": round(float(ema50.iloc[-1]), 2),
                 "rsi": round(float(rsi.iloc[-1]), 1),
+                "atr14": round(latest_atr14, 2) if latest_atr14 is not None else None,
+                "atr_pct": round(latest_atr14 / latest_price * 100, 2) if (latest_atr14 is not None and latest_price) else None,
                 "avg_vol_20d": int(avg_vol_20d),
                 "latest_vol": int(latest_vol),
                 "vol_ratio": round(latest_vol / avg_vol_20d, 2) if avg_vol_20d else None,
@@ -1604,6 +1608,72 @@ def format_stage2_eliminated_table(stage2_eliminated):
             reason = f"below the {REWARD_RISK_MINIMUM} floor"
         lines.append(f"{e['ticker']:8}{e['base_score']:>6}/55{rr_str:>14}{reason:>36}")
     return "\n".join(lines)
+
+
+def classify_trend(price, ema20, ema50):
+    if price > ema20 > ema50:
+        return "Bullish"
+    if price < ema20 < ema50:
+        return "Bearish"
+    return "Mixed"
+
+
+def build_ticker_flags(ind, in_stage1_shortlist):
+    """
+    Legend:
+      green_circle  Price > EMA20 > EMA50 (bullish alignment)
+      yellow_circle RSI 50-70 (healthy momentum zone)
+      red_circle    RSI > 75 (overbought)
+      blue_circle   ATR% > 4% (elevated volatility)
+      star          Cleared today's Stage 1 screen (Trend+Momentum+Earnings >= 45/55)
+    """
+    flags = []
+    if ind["price"] > ind["ema20"] > ind["ema50"]:
+        flags.append("\U0001F7E2")  # green circle
+    if 50 <= ind["rsi"] <= 70:
+        flags.append("\U0001F7E1")  # yellow circle
+    if ind["rsi"] > 75:
+        flags.append("\U0001F534")  # red circle
+    if ind["atr_pct"] is not None and ind["atr_pct"] > 4:
+        flags.append("\U0001F535")  # blue circle
+    if in_stage1_shortlist:
+        flags.append("\u2B50")  # star
+    return "".join(flags) if flags else "-"
+
+
+def format_full_universe_table(indicators, stage1_tickers):
+    """Every ticker in today's screening universe, technicals only - no
+    scoring gate applied, so nothing is hidden. Sorted alphabetically."""
+    lines = []
+    header = (
+        f"{'TICKER':8}{'PRICE':>9}{'EMA20':>9}{'EMA50':>9}{'RSI14':>8}"
+        f"{'ATR14($)':>10}{'ATR%':>7}  {'TREND':8}  FLAGS"
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+    no_data = []
+    for ticker in sorted(indicators.keys()):
+        ind = indicators.get(ticker)
+        if not ind:
+            no_data.append(ticker)
+            continue
+        trend = classify_trend(ind["price"], ind["ema20"], ind["ema50"])
+        flags = build_ticker_flags(ind, ticker in stage1_tickers)
+        atr14_str = f"{ind['atr14']:.2f}" if ind["atr14"] is not None else "n/a"
+        atr_pct_str = f"{ind['atr_pct']:.1f}%" if ind["atr_pct"] is not None else "n/a"
+        lines.append(
+            f"{ticker:8}{ind['price']:>9.2f}{ind['ema20']:>9.2f}{ind['ema50']:>9.2f}"
+            f"{ind['rsi']:>8.1f}{atr14_str:>10}{atr_pct_str:>7}  {trend:8}  {flags}"
+        )
+    table = "\n".join(lines)
+    legend = (
+        "Legend: \U0001F7E2 Price>EMA20>EMA50 (bullish align)  "
+        "\U0001F7E1 RSI 50-70  \U0001F534 RSI>75 (overbought)  "
+        "\U0001F535 ATR%>4 (elevated volatility)  "
+        "\u2B50 cleared today's Stage 1 screen (base score >= 45/55)"
+    )
+    no_data_note = f"\nNo data today: {', '.join(no_data)}" if no_data else ""
+    return f"{table}\n\n{legend}{no_data_note}"
 
 
 def format_watchlist_table(watchlist, indicators, scores):
@@ -2067,6 +2137,8 @@ def main():
     print("=" * 70)
 
     watchlist_table = format_watchlist_table(watchlist_us, indicators, scores)
+    stage1_tickers = {c["ticker"] for c in stage1_shortlist}
+    full_universe_table = format_full_universe_table(indicators, stage1_tickers)
     levels_table = format_levels_table(watchlist_us, indicators)
 
     trade_settings = portfolio["trade_settings"]
@@ -2211,12 +2283,19 @@ Changes today:
 {changes_text}
 
 ====================================================
-5. MARKET AND PRE-MARKET VALIDATION
+5. FULL UNIVERSE SNAPSHOT ({len(indicators)} tickers)
+====================================================
+Every ticker in today's screening universe, technicals only - nothing filtered out.
+
+{full_universe_table}
+
+====================================================
+6. MARKET AND PRE-MARKET VALIDATION
 ====================================================
 {premarket_section}
 
 ====================================================
-6. DATA-QUALITY ALERTS
+7. DATA-QUALITY ALERTS
 ====================================================
 {data_quality_text}
 
