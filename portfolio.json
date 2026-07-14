@@ -1,11 +1,6 @@
 {
   "holdings": [
     {
-      "ticker": "SKHYV",
-      "shares": 6,
-      "cost_basis": 160.4
-    },
-    {
       "ticker": "GOOG",
       "shares": 1,
       "cost_basis": 352.34
@@ -16,7 +11,9 @@
       "cost_basis": 1684.0
     }
   ],
-  "watchlist_us": [],
+  "watchlist_us": [
+    "META"
+  ],
   "closed_positions": [],
   "trade_settings": {
     "portfolio_value": 10000,
