@@ -27,11 +27,11 @@ FIRST_DATA_ROW = 5
 
 # 1-indexed column numbers, per the Trade Journal header row
 COL_TICKER = 3        # C
-COL_MARKET = 4        # D
-COL_ENTRY_PRICE = 7   # G
-COL_SHARES = 8        # H
-COL_EXIT_DATE = 16    # P
-COL_STATUS = 24       # X
+COL_MARKET = 4         # D
+COL_ENTRY_PRICE = 7    # G
+COL_SHARES = 8         # H
+COL_EXIT_DATE = 16     # P
+COL_STATUS = 24        # X
 
 
 def _is_open(status_value, exit_date_value) -> bool:
