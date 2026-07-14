@@ -64,7 +64,7 @@ US_CANDIDATE_UNIVERSE = [
     "MA","PYPL","SPGI","ICE","CME","BX","KKR","APO","COF","USB",
     "UNH","JNJ","LLY","PFE","MRK","ABBV","TMO","ABT","DHR","BMY",
     "AMGN","GILD","VRTX","REGN","ISRG","CVS","CI","HUM","MDT","SYK",
-    "XOM","CVX","COP","SLB","EOG","PXD","OXY","MPC","PSX","VLO",
+    "XOM","CVX","COP","SLB","EOG","OXY","MPC","PSX","VLO",
     "HD","LOW","MCD","SBUX","NKE","TJX","TGT","COST","WMT","PG",
     "KO","PEP","PM","MO","CL","KMB","GIS","MDLZ","EL","STZ",
     "BA","CAT","DE","HON","GE","RTX","LMT","NOC","GD","UPS",
@@ -73,6 +73,14 @@ US_CANDIDATE_UNIVERSE = [
     "LIN","APD","SHW","ECL","NEM","FCX","NUE","DOW","DD","PPG",
     "NEE","DUK","SO","D","AEP","EXC","SRE","PCG","XEL","ED",
     "PLD","AMT","EQIX","PSA","SPG","O","WELL","DLR","AVB","EQR",
+    # Added per user request - fills out Energy, Industrials, Materials/Mining,
+    # Consumer/Travel, Healthcare, and a couple of Tech names not already covered.
+    "SNDK","ARM",                     # Technology
+    "DVN","FANG","EQT",               # Energy
+    "URI",                            # Industrials
+    "CCJ","STLD",                     # Materials & Mining
+    "RCL","UAL","MGM","WYNN",         # Consumer/Travel
+    "MRNA","HCA",                     # Healthcare
 ]
 
 
@@ -1730,8 +1738,13 @@ def humanize_exception(context, e):
     elif "total_shares must be positive" in msg:
         clean = "Position size resolved to zero shares."
     else:
-        clean = "An internal calculation error occurred."
-    print(f"[data-quality] {context}: {msg}")  # raw detail goes to the log only
+        # Unrecognized error type - still print the raw detail to the log,
+        # but also surface a short version in the email instead of a
+        # content-free generic phrase, so a new/unexpected failure mode
+        # (e.g. auth, config, network) doesn't require a log dig every time.
+        short_msg = msg if len(msg) <= 160 else msg[:157] + "..."
+        clean = f"Unexpected error ({type(e).__name__}): {short_msg}"
+    print(f"[data-quality] {context}: {msg}")  # full raw detail always goes to the log too
     return clean
 
 
@@ -1759,6 +1772,14 @@ def build_atr_trade_plans(watchlist, trade_settings, indicators=None, scores=Non
                 tickers=ticker, period="15mo", interval="1d",
                 progress=False, auto_adjust=False,
             )
+            # yfinance sometimes returns MultiIndex columns even for a
+            # single ticker - same defensive unwrap as
+            # compute_technical_indicators, just never applied here before.
+            if isinstance(df.columns, pd.MultiIndex):
+                if ticker in df.columns.get_level_values(-1):
+                    df = df.xs(ticker, axis=1, level=-1)
+                elif ticker in df.columns.get_level_values(0):
+                    df = df[ticker]
             df = df.dropna(subset=["Close", "High", "Low", "Volume"])
             if df is None or len(df) < 30:
                 plans[ticker] = {
