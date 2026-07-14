@@ -2,15 +2,16 @@
   "holdings": [
     {
       "ticker": "SKHYV",
-      "shares": 3,
-      "cost_basis": 168.0
+      "shares": 6,
+      "cost_basis": 160.4
+    },
+    {
+      "ticker": "GOOG",
+      "shares": 1,
+      "cost_basis": 352.34
     }
   ],
-  "watchlist_us": [
-    "CRWD",
-    "LLY",
-    "PANW"
-  ],
+  "watchlist_us": [],
   "closed_positions": [],
   "trade_settings": {
     "portfolio_value": 10000,
