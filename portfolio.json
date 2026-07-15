@@ -9,6 +9,11 @@
       "ticker": "SNDK",
       "shares": 1,
       "cost_basis": 1684.0
+    },
+    {
+      "ticker": "IBM",
+      "shares": 1.6,
+      "cost_basis": 220.969
     }
   ],
   "watchlist_us": [],
