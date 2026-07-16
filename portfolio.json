@@ -7,11 +7,28 @@
     },
     {
       "ticker": "IBM",
-      "shares": 1.6,
+      "shares": 3.6,
       "cost_basis": 220.969
+    },
+    {
+      "ticker": "ARM",
+      "shares": 4,
+      "cost_basis": 298.0
+    },
+    {
+      "ticker": "SNDK",
+      "shares": 1.6,
+      "cost_basis": 1625.8
+    },
+    {
+      "ticker": "TSLA",
+      "shares": 2,
+      "cost_basis": 396.6
     }
   ],
-  "watchlist_us": [],
+  "watchlist_us": [
+    "MRNA"
+  ],
   "closed_positions": [],
   "trade_settings": {
     "portfolio_value": 10000,
