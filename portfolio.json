@@ -1,26 +1,5 @@
 {
-  "holdings": [
-    {
-      "ticker": "IBM",
-      "shares": 3.6,
-      "cost_basis": 220.969
-    },
-    {
-      "ticker": "ARM",
-      "shares": 4,
-      "cost_basis": 298.0
-    },
-    {
-      "ticker": "TSLA",
-      "shares": 2,
-      "cost_basis": 396.6
-    },
-    {
-      "ticker": "SNDK",
-      "shares": 0.6,
-      "cost_basis": 1538.0
-    }
-  ],
+  "holdings": [],
   "watchlist_us": [],
   "closed_positions": [],
   "trade_settings": {
