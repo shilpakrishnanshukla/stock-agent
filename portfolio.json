@@ -1,5 +1,46 @@
 {
-  "holdings": [],
+  "holdings": [
+    {
+      "ticker": "IBM",
+      "shares": 6,
+      "cost_basis": 216.6734
+    },
+    {
+      "ticker": "ARM",
+      "shares": 4,
+      "cost_basis": 298.0
+    },
+    {
+      "ticker": "TSLA",
+      "shares": 2,
+      "cost_basis": 396.6
+    },
+    {
+      "ticker": "CAT",
+      "shares": 0.5,
+      "cost_basis": 882.98
+    },
+    {
+      "ticker": "CCJ",
+      "shares": 5,
+      "cost_basis": 89.3
+    },
+    {
+      "ticker": "CCL",
+      "shares": 18,
+      "cost_basis": 26.15
+    },
+    {
+      "ticker": "GOOG",
+      "shares": 2,
+      "cost_basis": 347.38
+    },
+    {
+      "ticker": "GOLD",
+      "shares": 10,
+      "cost_basis": 40.5
+    }
+  ],
   "watchlist_us": [],
   "closed_positions": [],
   "trade_settings": {
