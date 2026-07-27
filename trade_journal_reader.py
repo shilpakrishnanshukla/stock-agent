@@ -57,7 +57,7 @@ def read_holdings_from_trade_journal(local_path: str, market: str = None, sheet_
     lots_by_ticker = defaultdict(lambda: {"shares": 0.0, "cost_total": 0.0})
 
     row = FIRST_DATA_ROW
-    while ws.cell(row=row, column=1).value not in (None, ""):
+    while ws.cell(row=row, column=COL_TICKER).value not in (None, ""):
         ticker = ws.cell(row=row, column=COL_TICKER).value
         row_market = ws.cell(row=row, column=COL_MARKET).value
         entry_price = ws.cell(row=row, column=COL_ENTRY_PRICE).value
