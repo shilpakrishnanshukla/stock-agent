@@ -1,6 +1,8 @@
 {
   "holdings": [],
-  "watchlist_us": [],
+  "watchlist_us": [
+    "MARA"
+  ],
   "closed_positions": [],
   "trade_settings": {
     "portfolio_value": 10000,
