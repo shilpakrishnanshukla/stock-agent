@@ -4,9 +4,17 @@ Reads currently OPEN positions from the "Trade Journal" tab and returns them
 in the shape analyze.py's holdings pipeline expects:
     [{"ticker": "AAPL", "shares": 10, "cost_basis": 187.32}, ...]
 
-A row counts as open when its Status column (X) says "Open" (case-
-insensitive). If Status is blank/unrecognized, an empty Exit Date (P) is
-used as the fallback signal. Rows explicitly marked "Closed" are always
+Column layout matches the actual "Trade Journal" tab header row (row 4):
+Entry Date(A), Company(B), Ticker(C), Entry Price(D), Shares(E), Position
+Value(F), Stop Loss(G), Target(H), ... Exit Date(M), ... Status(U), ...
+
+There is no dedicated "Market" column in this workbook - SG (SGX) tickers
+are identified by a ".SI" suffix (e.g. "D05.SI"); everything else is
+treated as US.
+
+A row counts as open when its Status column says "Open" (case-
+insensitive). If Status is blank/unrecognized, an empty Exit Date is used
+as the fallback signal. Rows explicitly marked "Closed" are always
 excluded even if Exit Date happens to be blank.
 
 Multiple open lots of the same ticker are combined into one holding, with
@@ -25,13 +33,12 @@ import openpyxl
 SHEET_NAME = "Trade Journal"
 FIRST_DATA_ROW = 5
 
-# 1-indexed column numbers, per the Trade Journal header row
+# 1-indexed column numbers, per the actual Trade Journal header row (row 4)
 COL_TICKER = 3        # C
-COL_MARKET = 4         # D
-COL_ENTRY_PRICE = 7    # G
-COL_SHARES = 8         # H
-COL_EXIT_DATE = 16     # P
-COL_STATUS = 24        # X
+COL_ENTRY_PRICE = 4   # D
+COL_SHARES = 5        # E
+COL_EXIT_DATE = 13    # M
+COL_STATUS = 21       # U
 
 
 def _is_open(status_value, exit_date_value) -> bool:
@@ -45,11 +52,17 @@ def _is_open(status_value, exit_date_value) -> bool:
     return exit_date_value in (None, "")
 
 
+def _infer_market(ticker: str) -> str:
+    """No dedicated Market column exists - SG names carry a .SI suffix,
+    everything else is treated as US."""
+    return "SG" if ticker.upper().endswith(".SI") else "US"
+
+
 def read_holdings_from_trade_journal(local_path: str, market: str = None, sheet_name: str = SHEET_NAME) -> list:
     """
-    market: if given (e.g. "US" or "SG"), only rows whose Market column
-    matches are included - so analyze.py and analyze_sg.py each pick up
-    only their own holdings from the same shared workbook.
+    market: if given (e.g. "US" or "SG"), only tickers matching that
+    inferred market are included - so analyze.py and analyze_sg.py each
+    pick up only their own holdings from the same shared workbook.
     """
     wb = openpyxl.load_workbook(local_path, data_only=True)
     ws = wb[sheet_name]
@@ -59,7 +72,6 @@ def read_holdings_from_trade_journal(local_path: str, market: str = None, sheet_
     row = FIRST_DATA_ROW
     while ws.cell(row=row, column=COL_TICKER).value not in (None, ""):
         ticker = ws.cell(row=row, column=COL_TICKER).value
-        row_market = ws.cell(row=row, column=COL_MARKET).value
         entry_price = ws.cell(row=row, column=COL_ENTRY_PRICE).value
         shares = ws.cell(row=row, column=COL_SHARES).value
         exit_date = ws.cell(row=row, column=COL_EXIT_DATE).value
@@ -68,12 +80,14 @@ def read_holdings_from_trade_journal(local_path: str, market: str = None, sheet_
 
         if not ticker or not entry_price or not shares:
             continue
-        if market and str(row_market or "").strip().upper() != market.strip().upper():
+
+        key = str(ticker).strip().upper()
+
+        if market and _infer_market(key) != market.strip().upper():
             continue
         if not _is_open(status, exit_date):
             continue
 
-        key = str(ticker).strip().upper()
         lot = lots_by_ticker[key]
         lot["shares"] += float(shares)
         lot["cost_total"] += float(shares) * float(entry_price)
