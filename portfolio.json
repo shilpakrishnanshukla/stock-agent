@@ -1,11 +1,6 @@
 {
   "holdings": [
     {
-      "ticker": "IBM",
-      "shares": 6,
-      "cost_basis": 216.6734
-    },
-    {
       "ticker": "ARM",
       "shares": 4,
       "cost_basis": 298.0
