@@ -52,13 +52,13 @@ WATCHLIST_MAX_US = 15
 TRADE_PLANNER_LOCAL = "trade_planner_temp.xlsx"
 TRADE_PLANNER_MARKET = "US"
 
-# User-curated universe: exactly the tickers requested across sector
-# messages (Technology, Energy, Industrials, Materials & Mining,
-# Consumer/Travel, Healthcare, Oil Services, Gold & Precious Metals,
-# Uranium, Crypto Miners, Airlines, Cruise Lines, Casinos, Agriculture),
-# deduplicated. Replaces the earlier ~150-ticker generic large-cap list,
-# which was too broad/slow for a daily run.
-US_CANDIDATE_UNIVERSE = [
+# DEFAULT_ACTIVE_UNIVERSE: the ~50-ticker working set actually screened
+# every weekday. This is only a starting default - on weekend runs, the
+# active universe is recomputed by scoring the full MASTER_CANDIDATE_POOL
+# below and keeping the top ACTIVE_UNIVERSE_SIZE, then persisted into
+# portfolio.json under "active_universe" so weekday runs just reuse it
+# without rescoring 200+ tickers every day. See select_weekly_universe().
+DEFAULT_ACTIVE_UNIVERSE = [
     "NVDA","AMD","CRWD","AMAT","SNDK","PLTR","ARM","AVGO",     # Technology
     "XOM","CVX","OXY","DVN","FANG","EQT",                      # Energy
     "SLB","HAL","BKR",                                          # Oil Services
@@ -72,6 +72,41 @@ US_CANDIDATE_UNIVERSE = [
     "CAT","DE","URI",                                           # Industrials
     "NUE","STLD","FCX","AA",                                    # Steel & Metals
     "MOS","CF","NTR",                                           # Agriculture
+]
+
+ACTIVE_UNIVERSE_SIZE = 50
+
+# MASTER_CANDIDATE_POOL: the full ~200-ticker pool the weekend review scores
+# to pick each week's active universe. This is the original broad large-cap
+# list plus every sector ticker requested since, deduplicated.
+MASTER_CANDIDATE_POOL = [
+    "AAPL","MSFT","NVDA","GOOGL","AMZN","META","AVGO","TSLA","AMD","CRM",
+    "ORCL","ADBE","INTC","QCOM","TXN","MU","AMAT","LRCX","KLAC","CSCO",
+    "IBM","NOW","PANW","SNPS","CDNS","INTU","FTNT","PLTR","UBER","ABNB",
+    "SHOP","NET","DDOG","SNOW","CRWD","ZS","MDB","TEAM","WDAY","ADSK",
+    "JPM","BAC","WFC","GS","MS","C","SCHW","BLK","AXP","V",
+    "MA","PYPL","SPGI","ICE","CME","BX","KKR","APO","COF","USB",
+    "UNH","JNJ","LLY","PFE","MRK","ABBV","TMO","ABT","DHR","BMY",
+    "AMGN","GILD","VRTX","REGN","ISRG","CVS","CI","HUM","MDT","SYK",
+    "XOM","CVX","COP","SLB","EOG","OXY","MPC","PSX","VLO","HD",
+    "LOW","MCD","SBUX","NKE","TJX","TGT","COST","WMT","PG","KO",
+    "PEP","PM","MO","CL","KMB","GIS","MDLZ","EL","STZ","BA",
+    "CAT","DE","HON","GE","RTX","LMT","NOC","GD","UPS","FDX",
+    "UNP","CSX","NSC","WM","ETN","EMR","ITW","PH","ROK","DIS",
+    "NFLX","CMCSA","T","VZ","TMUS","CHTR","WBD","EA","TTWO","LIN",
+    "APD","SHW","ECL","NEM","FCX","NUE","DOW","DD","PPG","NEE",
+    "DUK","SO","D","AEP","EXC","SRE","PCG","XEL","ED","PLD",
+    "AMT","EQIX","PSA","SPG","O","WELL","DLR","AVB","EQR","SNDK",
+    "ARM","DVN","FANG","EQT","URI","CCJ","STLD","RCL","UAL","MGM",
+    "WYNN","MRNA","HCA","HAL","BKR","AEM","GOLD","WPM","UEC","LEU",
+    "MARA","RIOT","CLSK","DAL","AAL","CCL","NCLH","LVS","AA","MOS",
+    "CF","NTR",
+    # Added per user request - broader scrub of US-listed Software, AI, and
+    # Semiconductor names not already covered above.
+    "HUBS","MNDY","CFLT","GTLB","TWLO","OKTA","CYBR","DT","ESTC","DOCU",     # Software
+    "APP","TTD","GWRE","VEEV","ZM","BILL","PCOR","PTC","MANH","TYL","SSNC","FICO",
+    "AI","SOUN","BBAI","PATH","UPST","SYM","INOD","IONQ",                    # AI
+    "TSM","ASML","ON","MRVL","MCHP","ADI","SWKS","QRVO","MPWR","WOLF","GFS","TER","ENTG",  # Semiconductors
 ]
 
 DEFAULT_TRADE_SETTINGS = {
@@ -442,7 +477,89 @@ other text, no markdown fences:
         return {}
 
 
-def build_premarket_gaps(watchlist):
+def fetch_overnight_move(ticker):
+    """Compares the latest extended-hours price to the previous regular-
+    session close - post-market price if this runs in the evening,
+    pre-market price if it runs the next morning (Yahoo only populates
+    whichever session is currently active; this picks up whichever one
+    exists rather than assuming a specific run time). Returns None if
+    neither is available (e.g. mid-day, or no quote for this name).
+
+    Unlike fetch_premarket_gap (used only for the final watchlist
+    candidates), this is meant to run across the whole active universe -
+    it's a broader "what dropped overnight" scan, not a pre-trade sizing
+    check."""
+    try:
+        info = yf.Ticker(ticker).info
+        previous_close = info.get("regularMarketPreviousClose") or info.get("previousClose")
+        post_price = info.get("postMarketPrice")
+        pre_price = info.get("preMarketPrice")
+
+        if post_price is not None:
+            extended_price, session = post_price, "post-market"
+        elif pre_price is not None:
+            extended_price, session = pre_price, "pre-market"
+        else:
+            return None
+
+        if previous_close is None:
+            return None
+
+        move_pct = (extended_price - previous_close) / previous_close * 100
+        return {
+            "ticker": ticker,
+            "session": session,
+            "previous_close": round(previous_close, 2),
+            "extended_price": round(extended_price, 2),
+            "move_pct": round(move_pct, 2),
+        }
+    except Exception:
+        return None
+
+
+def build_overnight_movers(tickers, drop_threshold_pct=-2.0):
+    """Scans every given ticker for its extended-hours move and returns
+    (movers, no_data_count) where movers is a list of result dicts sorted
+    most-negative-first (biggest drops first) - includes ALL tickers with
+    data, not just those past the threshold, so nothing is hidden; the
+    threshold only affects the "notable drops" callout in the formatter."""
+    movers = []
+    no_data = 0
+    for ticker in tickers:
+        result = fetch_overnight_move(ticker)
+        if result is None:
+            no_data += 1
+            continue
+        movers.append(result)
+    movers.sort(key=lambda m: m["move_pct"])
+    return movers, no_data
+
+
+def format_overnight_movers_section(movers, no_data_count, drop_threshold_pct=-2.0):
+    notable_drops = [m for m in movers if m["move_pct"] <= drop_threshold_pct]
+    lines = [
+        f"Scanned {len(movers) + no_data_count} tickers "
+        f"({len(movers)} had extended-hours data, {no_data_count} did not).",
+        f"{len(notable_drops)} dropped {abs(drop_threshold_pct):.0f}%+ vs previous close.",
+        "",
+    ]
+    if not movers:
+        lines.append("(no extended-hours data available for any ticker right now)")
+        return "\n".join(lines)
+
+    header = f"{'TICKER':8}{'PREV CLOSE':>12}{'EXT PRICE':>12}{'MOVE %':>9}  SESSION"
+    lines.append(header)
+    lines.append("-" * len(header))
+    for m in movers:
+        flag = " \U0001F534" if m["move_pct"] <= drop_threshold_pct else ""
+        lines.append(
+            f"{m['ticker']:8}{m['previous_close']:>12.2f}{m['extended_price']:>12.2f}"
+            f"{m['move_pct']:>+8.2f}%  {m['session']}{flag}"
+        )
+    return "\n".join(lines)
+
+
+
     """Fetches pre-market gap data for the final shortlisted tickers, then
     gets an explanation for any that gapped significantly (status other than
     'OK'). Returns {ticker: gap_dict_or_None}, with an 'explanation' key
@@ -1471,7 +1588,7 @@ def screen_watchlist(current_watchlist, holdings_tickers, universe_list=None, ma
       included) and take the top `max_size` as the final watchlist.
 
     `universe_list`, `max_size`, and `stage1_size` default to the US settings
-    (US_CANDIDATE_UNIVERSE, WATCHLIST_MAX_US, STAGE1_SHORTLIST_SIZE) so
+    (DEFAULT_ACTIVE_UNIVERSE, WATCHLIST_MAX_US, STAGE1_SHORTLIST_SIZE) so
     existing callers don't need to change; pass different values to run this
     same screen against a different market/universe (e.g. SGX).
 
@@ -1480,7 +1597,7 @@ def screen_watchlist(current_watchlist, holdings_tickers, universe_list=None, ma
       stage1_shortlist = list of dicts for the top `stage1_size` that cleared Stage 1
       stage2_eliminated = list of dicts for Stage 1 survivors cut at Stage 2
     """
-    universe_list = universe_list if universe_list is not None else US_CANDIDATE_UNIVERSE
+    universe_list = universe_list if universe_list is not None else DEFAULT_ACTIVE_UNIVERSE
     max_size = max_size if max_size is not None else WATCHLIST_MAX_US
     stage1_size = stage1_size if stage1_size is not None else STAGE1_SHORTLIST_SIZE
 
@@ -1572,6 +1689,86 @@ def screen_watchlist(current_watchlist, holdings_tickers, universe_list=None, ma
         )
 
     return new_watchlist, changes, indicators, scores, stage1_shortlist, stage2_eliminated
+
+
+def select_weekly_universe(master_pool, holdings_tickers, previous_universe=None, top_n=ACTIVE_UNIVERSE_SIZE):
+    """
+    Weekend-only job: scores every ticker in `master_pool` (excluding
+    current holdings, which can't be "candidates" for a watchlist they're
+    already in) on the full Trend/Momentum/Earnings/Location score (same
+    scoring functions the daily screen uses), ranks by total score, and
+    keeps the top `top_n`.
+
+    Current holdings are then added back into the result unconditionally,
+    even if their score wouldn't have made the cut - so a held position
+    never silently drops out of the tracked universe (and its technicals
+    keep showing in the Full Universe Snapshot table) just because it's
+    no longer a top scorer.
+
+    Returns (new_universe, review) where review is a dict with enough
+    detail for an email section: how many were scored, the score cutoff,
+    which tickers were added/removed vs `previous_universe`, and which
+    holdings were force-included below the cutoff.
+    """
+    scoring_pool = [t for t in master_pool if t not in holdings_tickers]
+    indicators = compute_technical_indicators(scoring_pool)
+
+    scored = []
+    no_data = []
+    for ticker in scoring_pool:
+        ind = indicators.get(ticker)
+        if not ind:
+            no_data.append(ticker)
+            continue
+        earnings_days = get_earnings_trading_days_away(ticker)
+        s = score_ticker(ind, earnings_days)
+        scored.append((ticker, s["total"]))
+
+    scored.sort(key=lambda kv: kv[1], reverse=True)
+    top_tickers = [t for t, _ in scored[:top_n]]
+    cutoff_score = scored[top_n - 1][1] if len(scored) >= top_n else (scored[-1][1] if scored else None)
+
+    holdings_forced_in = [t for t in holdings_tickers if t not in top_tickers]
+    new_universe = sorted(set(top_tickers) | set(holdings_tickers))
+
+    previous_set = set(previous_universe) if previous_universe else set()
+    new_set = set(new_universe)
+
+    review = {
+        "scored_count": len(scored),
+        "no_data_count": len(no_data),
+        "no_data_tickers": no_data,
+        "cutoff_score": cutoff_score,
+        "top_n": top_n,
+        "final_universe_size": len(new_universe),
+        "holdings_forced_in": holdings_forced_in,
+        "added": sorted(new_set - previous_set),
+        "removed": sorted(previous_set - new_set),
+    }
+    return new_universe, review
+
+
+def format_universe_review_section(review):
+    lines = [
+        f"Scored {review['scored_count']} tickers from the master pool "
+        f"({review['no_data_count']} had no usable data today).",
+        f"Kept the top {review['top_n']} by score" + (
+            f" (cutoff score: {review['cutoff_score']}/85)." if review["cutoff_score"] is not None else "."
+        ),
+    ]
+    if review["holdings_forced_in"]:
+        lines.append(
+            f"Held below the cutoff but kept anyway (current holding): "
+            f"{', '.join(review['holdings_forced_in'])}"
+        )
+    lines.append(f"Active universe is now {review['final_universe_size']} tickers.")
+    if review["added"]:
+        lines.append(f"Added vs last week: {', '.join(review['added'])}")
+    if review["removed"]:
+        lines.append(f"Dropped vs last week: {', '.join(review['removed'])}")
+    if not review["added"] and not review["removed"]:
+        lines.append("No change vs last week's active universe.")
+    return "\n".join(lines)
 
 
 def format_stage1_table(stage1_shortlist):
@@ -2109,10 +2306,27 @@ def main():
     watchlist_us = [t for t in watchlist_us if t not in holdings_tickers]
     changes_log = [f"- Removed {t}: now an actual holding, tracked there instead" for t in auto_removed]
 
+    # --- Weekend-only: re-score the full master pool and pick the new
+    #     active universe for the week ahead. Weekdays just reuse whatever
+    #     was last persisted. Either way, `active_universe` feeds the screen. ---
+    active_universe = portfolio.get("active_universe", DEFAULT_ACTIVE_UNIVERSE)
+    universe_review = None
+    if weekend:
+        try:
+            active_universe, universe_review = select_weekly_universe(
+                MASTER_CANDIDATE_POOL, holdings_tickers, previous_universe=active_universe,
+            )
+            portfolio["active_universe"] = active_universe
+        except Exception as e:
+            clean = humanize_exception("weekly universe review", e)
+            data_quality_alerts.append(
+                f"Weekly universe review failed, keeping last active universe - {clean}"
+            )
+
     # --- Watchlist: score-based technical screen (top 15 by total score) ---
     try:
         watchlist_us, screen_changes, indicators, scores, stage1_shortlist, stage2_eliminated = screen_watchlist(
-            watchlist_us, holdings_tickers
+            watchlist_us, holdings_tickers, universe_list=active_universe,
         )
         changes_log += screen_changes
     except Exception as e:
@@ -2138,8 +2352,28 @@ def main():
 
     watchlist_table = format_watchlist_table(watchlist_us, indicators, scores)
     stage1_tickers = {c["ticker"] for c in stage1_shortlist}
-    full_universe_table = format_full_universe_table(indicators, stage1_tickers)
+
+    # Holdings are deliberately excluded from `indicators` above (they can't
+    # be "candidates" for a watchlist they're already in) - but the user
+    # wants them visible in the snapshot table regardless. Fetch their
+    # technicals separately and merge in just for the table.
+    try:
+        holdings_indicators = compute_technical_indicators(holdings_tickers) if holdings_tickers else {}
+    except Exception:
+        holdings_indicators = {}
+    snapshot_indicators = {**indicators, **holdings_indicators}
+    full_universe_table = format_full_universe_table(snapshot_indicators, stage1_tickers)
     levels_table = format_levels_table(watchlist_us, indicators)
+
+    # --- Overnight / post-market movers: same ticker set as the snapshot
+    #     table above, scanned for extended-hours drops vs previous close. ---
+    try:
+        overnight_movers, overnight_no_data = build_overnight_movers(sorted(snapshot_indicators.keys()))
+        overnight_movers_section = format_overnight_movers_section(overnight_movers, overnight_no_data)
+    except Exception as e:
+        clean = humanize_exception("overnight movers scan", e)
+        overnight_movers_section = f"Overnight movers scan unavailable - {clean}"
+        data_quality_alerts.append(f"Overnight movers scan unavailable - {clean}")
 
     trade_settings = portfolio["trade_settings"]
     trade_plans = build_trade_plans(watchlist_us, indicators, trade_settings)
@@ -2198,6 +2432,16 @@ def main():
     data_quality_text = (
         "\n".join(f"- {a}" for a in data_quality_alerts) if data_quality_alerts else "None."
     )
+
+    if universe_review is not None:
+        universe_review_section = format_universe_review_section(universe_review)
+    elif weekend:
+        universe_review_section = "Weekly universe review did not complete this run - see Data-Quality Alerts."
+    else:
+        universe_review_section = (
+            "Not applicable - weekday. The active universe is rescored every weekend; "
+            "today's screen reuses the list from the most recent weekend review."
+        )
 
     report_label = "WEEKEND STRATEGY REVIEW" if weekend else "DAILY PRE-MARKET NOTE"
     if weekend:
@@ -2283,19 +2527,34 @@ Changes today:
 {changes_text}
 
 ====================================================
-5. FULL UNIVERSE SNAPSHOT ({len(indicators)} tickers)
+5. WEEKLY UNIVERSE REVIEW
 ====================================================
-Every ticker in today's screening universe, technicals only - nothing filtered out.
+{universe_review_section}
+
+====================================================
+6. FULL UNIVERSE SNAPSHOT ({len(snapshot_indicators)} tickers)
+====================================================
+Every ticker in the active universe, technicals only - nothing filtered out.
+Holdings are always included here even if excluded from the watchlist screen itself.
 
 {full_universe_table}
 
 ====================================================
-6. MARKET AND PRE-MARKET VALIDATION
+7. OVERNIGHT / POST-MARKET MOVERS
+====================================================
+Every active-universe ticker's move vs previous close, in whichever extended-hours
+session has data right now (post-market in the evening, pre-market the next morning).
+Sorted biggest drop first. \U0001F534 flags a drop of 2%+.
+
+{overnight_movers_section}
+
+====================================================
+8. MARKET AND PRE-MARKET VALIDATION
 ====================================================
 {premarket_section}
 
 ====================================================
-7. DATA-QUALITY ALERTS
+9. DATA-QUALITY ALERTS
 ====================================================
 {data_quality_text}
 
