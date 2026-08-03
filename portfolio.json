@@ -41,5 +41,7 @@
     "max_risk_pct": 0.01,
     "max_position_pct": 0.15
   },
-  "watchlist_sg": []
+  "watchlist_sg": [
+    "H78.SI"
+  ]
 }
