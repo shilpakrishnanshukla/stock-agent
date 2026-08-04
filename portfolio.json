@@ -11,16 +11,6 @@
       "cost_basis": 396.6
     },
     {
-      "ticker": "CAT",
-      "shares": 0.5,
-      "cost_basis": 882.98
-    },
-    {
-      "ticker": "CCJ",
-      "shares": 5,
-      "cost_basis": 89.3
-    },
-    {
       "ticker": "GOOG",
       "shares": 2,
       "cost_basis": 347.38
@@ -31,9 +21,7 @@
       "cost_basis": 40.5
     }
   ],
-  "watchlist_us": [
-    "OXY"
-  ],
+  "watchlist_us": [],
   "closed_positions": [],
   "trade_settings": {
     "portfolio_value": 10000,
