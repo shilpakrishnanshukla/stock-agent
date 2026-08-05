@@ -1,19 +1,9 @@
 {
   "holdings": [
     {
-      "ticker": "ARM",
-      "shares": 4,
-      "cost_basis": 298.0
-    },
-    {
       "ticker": "TSLA",
       "shares": 2,
       "cost_basis": 396.6
-    },
-    {
-      "ticker": "GOOG",
-      "shares": 2,
-      "cost_basis": 347.38
     },
     {
       "ticker": "GOLD",
