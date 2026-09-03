@@ -18,7 +18,5 @@
     "max_risk_pct": 0.01,
     "max_position_pct": 0.15
   },
-  "watchlist_sg": [
-    "F34.SI"
-  ]
+  "watchlist_sg": []
 }
