@@ -44,7 +44,6 @@ import anthropic
 
 from gdrive_sync import download_workbook, upload_workbook
 from trade_planner_writer import update_trade_planner
-from trade_journal_reader import read_holdings_from_trade_journal
 
 PORTFOLIO_FILE = "portfolio.json"
 MODEL = "claude-sonnet-4-6"
@@ -74,7 +73,7 @@ DEFAULT_ACTIVE_UNIVERSE = [
     "MOS","CF","NTR",                                           # Agriculture
 ]
 
-ACTIVE_UNIVERSE_SIZE = 50
+ACTIVE_UNIVERSE_SIZE = 100
 
 # MASTER_CANDIDATE_POOL: the full ~200-ticker pool the weekend review scores
 # to pick each week's active universe. This is the original broad large-cap
@@ -174,21 +173,15 @@ def build_decision_summary(
     the single most important message, stated plainly before any tables."""
     parts = []
 
-    if not holdings:
-        parts.append("No current holdings.")
-    else:
-        action_word = "action" if portfolio_action_count == 1 else "actions"
-        if portfolio_action_count == 0:
-            parts.append(f"{len(holdings)} holding(s), no actions needed today.")
-        else:
-            parts.append(f"{len(holdings)} holding(s), {portfolio_action_count} {action_word} needed - see Portfolio Actions.")
+    parts.append("Portfolio tracking is disabled - this note covers screening candidates only.")
 
     if not watchlist:
         parts.append("No candidates passed today's screen.")
     else:
-        ranked = sorted(watchlist, key=lambda t: scores.get(t, {}).get("total", 0), reverse=True)
+        ranked = sorted(watchlist, key=lambda t: scores.get(t, {}).get("drop_pct", 0))
         top_ticker = ranked[0]
-        top_score = scores.get(top_ticker, {}).get("total", "n/a")
+        top_drop = scores.get(top_ticker, {}).get("drop_pct", "n/a")
+        top_window = scores.get(top_ticker, {}).get("drop_window", "n/a")
         fixed_plan = trade_plans.get(top_ticker)
         rr = fixed_plan["reward_risk"] if fixed_plan else None
         rr_text = f"fixed-buffer R:R {rr}x" if rr is not None else "fixed-buffer R:R unavailable"
@@ -196,7 +189,7 @@ def build_decision_summary(
         if len(watchlist) == 1:
             lead = f"One candidate passed: {top_ticker}."
         else:
-            lead = f"{len(watchlist)} candidates passed. Strongest: {top_ticker} (score {top_score}/85)."
+            lead = f"{len(watchlist)} candidates passed. Biggest decliner: {top_ticker} (down {top_drop}% over {top_window})."
 
         exec_status = get_execution_status(top_ticker, trade_plans, atr_trade_plans)
         if exec_status == "Ready":
@@ -1385,6 +1378,22 @@ def compute_technical_indicators(tickers):
             latest_vol = float(volume.iloc[-1])
             latest_price = float(close.iloc[-1])
 
+            # Recent multi-day drop check (approximates 24/48/72 hours using
+            # daily bars - 1/2/3 trading days back). Used by the "New Trade
+            # Candidates" screen instead of EMA/RSI trend-following.
+            drop_windows = {}
+            for days_back, label in ((1, "1d"), (2, "2d"), (3, "3d")):
+                idx = -(days_back + 1)
+                if len(close) > days_back:
+                    past_price = float(close.iloc[idx])
+                    if past_price:
+                        drop_windows[label] = round((latest_price - past_price) / past_price * 100, 2)
+            if drop_windows:
+                max_drop_window = min(drop_windows, key=lambda k: drop_windows[k])
+                max_drop_pct = drop_windows[max_drop_window]
+            else:
+                max_drop_window, max_drop_pct = None, None
+
             # Compute pivots once, reuse for trend structure + support/resistance.
             pivots_df = add_pivots(df, left=2, right=2)
             structure = get_pivot_structure_from_pivots(pivots_df)
@@ -1411,6 +1420,11 @@ def compute_technical_indicators(tickers):
                 "nearest_support": round(nearest_support, 2) if nearest_support is not None else None,
                 "nearest_resistance": round(nearest_resistance, 2) if nearest_resistance is not None else None,
                 "reward_risk": rr,
+                "chg_1d_pct": drop_windows.get("1d"),
+                "chg_2d_pct": drop_windows.get("2d"),
+                "chg_3d_pct": drop_windows.get("3d"),
+                "max_drop_pct": max_drop_pct,
+                "max_drop_window": max_drop_window,
             }
         except Exception:
             results[ticker] = None
@@ -1575,17 +1589,23 @@ REWARD_RISK_MINIMUM = 2.5
 STAGE1_SHORTLIST_SIZE = 20
 
 
+DROP_THRESHOLD_PCT = -4.0  # candidate must have dropped at least this much within 1-3 trading days
+
+
 def screen_watchlist(current_watchlist, holdings_tickers, universe_list=None, max_size=None, stage1_size=None):
     """Two-stage gate, then rank:
-      Stage 1: reject anything scoring below BASE_SCORE_MINIMUM out of 55 on
-               Trend + Momentum + Earnings alone (the original three
-               categories, before Location/reward:risk is even considered).
-               The top `stage1_size` survivors (by base score) are kept as
+      Stage 1: keep only tickers that dropped at least DROP_THRESHOLD_PCT
+               (4%) within the last 1-3 trading days (approximating the
+               last 24-72 hours off daily bars) - the worst of the 1d/2d/3d
+               windows is what's checked, so a sharp single-day drop
+               qualifies even if the 3-day cumulative change looks milder.
+               Ranked biggest-drop-first; the top `stage1_size` are kept as
                the Stage 1 shortlist shown in the email.
       Stage 2: of that Stage 1 shortlist, reject anything with reward:risk
-               below REWARD_RISK_MINIMUM.
-      Then rank Stage 2 survivors by total score (out of 85, Location
-      included) and take the top `max_size` as the final watchlist.
+               below REWARD_RISK_MINIMUM (support/resistance-based entry,
+               stop, target - unchanged from before).
+      Final watchlist: Stage 2 survivors, ranked biggest-drop-first, top
+      `max_size` kept.
 
     `universe_list`, `max_size`, and `stage1_size` default to the US settings
     (DEFAULT_ACTIVE_UNIVERSE, WATCHLIST_MAX_US, STAGE1_SHORTLIST_SIZE) so
@@ -1606,35 +1626,26 @@ def screen_watchlist(current_watchlist, holdings_tickers, universe_list=None, ma
 
     indicators = compute_technical_indicators(universe)
 
-    stage1_candidates = []  # everything that cleared the base score minimum
+    stage1_candidates = []  # everything that dropped enough to qualify
 
     for ticker in universe:
         ind = indicators.get(ticker)
         if not ind:
             continue
 
-        trend_score, _ = score_trend(ind)
-        momentum_score, _ = score_momentum(ind)
-        earnings_days = get_earnings_trading_days_away(ticker)
-        earnings_score, _ = score_earnings(earnings_days)
-        base_score = trend_score + momentum_score + earnings_score
-
-        if base_score < BASE_SCORE_MINIMUM:
+        max_drop = ind.get("max_drop_pct")
+        if max_drop is None or max_drop > DROP_THRESHOLD_PCT:
             continue
 
         stage1_candidates.append({
             "ticker": ticker,
-            "base_score": base_score,
-            "trend": trend_score,
-            "momentum": momentum_score,
-            "earnings": earnings_score,
-            "earnings_days": earnings_days,
+            "drop_pct": max_drop,
+            "drop_window": ind.get("max_drop_window"),
         })
 
-    # Keep only the top N by base score as the Stage 1 shortlist that
-    # actually proceeds to the reward:risk check - matches "show me the
-    # first 20 it shortlisted" rather than every single Stage 1 passer.
-    stage1_candidates.sort(key=lambda c: c["base_score"], reverse=True)
+    # Keep only the top N by drop size as the Stage 1 shortlist that
+    # actually proceeds to the reward:risk check.
+    stage1_candidates.sort(key=lambda c: c["drop_pct"])  # most negative (biggest drop) first
     stage1_shortlist = stage1_candidates[:stage1_size]
 
     scores = {}
@@ -1649,20 +1660,23 @@ def screen_watchlist(current_watchlist, holdings_tickers, universe_list=None, ma
         if rr_value is None or rr_value < REWARD_RISK_MINIMUM:
             stage2_eliminated.append({
                 "ticker": ticker,
-                "base_score": candidate["base_score"],
+                "drop_pct": candidate["drop_pct"],
                 "reward_risk": rr_value,
             })
             continue
 
-        scores[ticker] = score_ticker(ind, candidate["earnings_days"])
+        earnings_days = get_earnings_trading_days_away(ticker)  # informational only, not a gate
+        scores[ticker] = {
+            "drop_pct": candidate["drop_pct"],
+            "drop_window": candidate["drop_window"],
+            "reward_risk": rr_value,
+            "earnings_days_away": earnings_days,
+        }
 
-    ranked = sorted(scores.items(), key=lambda kv: kv[1]["total"], reverse=True)
+    ranked = sorted(scores.items(), key=lambda kv: kv[1]["drop_pct"])  # biggest drop first
     new_watchlist = [ticker for ticker, _ in ranked[:max_size]]
 
     # Simple day-over-day diff, same as before, for the "changes today" log.
-    rejected_base_lookup = {
-        c["ticker"]: c["base_score"] for c in stage1_candidates if c["base_score"] < BASE_SCORE_MINIMUM
-    }
     rejected_rr_lookup = {e["ticker"]: e["reward_risk"] for e in stage2_eliminated}
 
     changes = []
@@ -1676,16 +1690,17 @@ def screen_watchlist(current_watchlist, holdings_tickers, universe_list=None, ma
         else:
             s = scores.get(ticker)
             if s:
-                changes.append(f"- Dropped {ticker}: score {s['total']}/85, no longer in the top {max_size}")
+                changes.append(f"- Dropped {ticker}: down {s['drop_pct']:.2f}%, no longer in the top {max_size} declines")
             else:
-                changes.append(f"- Dropped {ticker}: below the {BASE_SCORE_MINIMUM}/55 base score minimum or outside the top {stage1_size}")
+                changes.append(
+                    f"- Dropped {ticker}: no longer down {abs(DROP_THRESHOLD_PCT):.0f}%+ in the last 72 hours, "
+                    f"or outside the top {stage1_size}"
+                )
 
     for ticker in new_set - old_set:
         s = scores[ticker]
         changes.append(
-            f"- Added {ticker}: score {s['total']}/85 "
-            f"(Trend {s['trend']}/25, Momentum {s['momentum']}/20, "
-            f"Earnings {s['earnings']}/10, Location {s['location']}/30)"
+            f"- Added {ticker}: down {s['drop_pct']:.2f}% ({s['drop_window']}), reward:risk {s['reward_risk']}x"
         )
 
     return new_watchlist, changes, indicators, scores, stage1_shortlist, stage2_eliminated
@@ -1772,18 +1787,17 @@ def format_universe_review_section(review):
 
 
 def format_stage1_table(stage1_shortlist):
-    """The top N candidates that cleared the base score minimum (Stage 1),
-    ranked by base score, before the reward:risk check is even applied."""
+    """The top N candidates that dropped enough to clear Stage 1, ranked
+    biggest-drop-first, before the reward:risk check is even applied."""
     lines = []
-    header = f"{'TICKER':8}{'BASE':>8}{'TREND':>8}{'MOM':>6}{'EARN':>6}"
+    header = f"{'TICKER':8}{'DROP %':>9}{'WINDOW':>8}"
     lines.append(header)
     lines.append("-" * len(header))
     for c in stage1_shortlist:
-        lines.append(
-            f"{c['ticker']:8}{c['base_score']:>6}/55{c['trend']:>7}/25"
-            f"{c['momentum']:>5}/20{c['earnings']:>5}/10"
-        )
-    return "\n".join(lines) if stage1_shortlist else "(no candidates cleared the base score minimum today)"
+        lines.append(f"{c['ticker']:8}{c['drop_pct']:>+8.2f}%{c['drop_window']:>8}")
+    return "\n".join(lines) if stage1_shortlist else (
+        f"(no candidates dropped {abs(DROP_THRESHOLD_PCT):.0f}%+ in the last 72 hours today)"
+    )
 
 
 def format_stage2_eliminated_table(stage2_eliminated):
@@ -1792,7 +1806,7 @@ def format_stage2_eliminated_table(stage2_eliminated):
     if not stage2_eliminated:
         return "(none - every Stage 1 name also cleared the reward:risk minimum today)"
     lines = []
-    header = f"{'TICKER':8}{'BASE':>8}{'REWARD:RISK':>14}{'REASON':>36}"
+    header = f"{'TICKER':8}{'DROP %':>9}{'REWARD:RISK':>14}{'REASON':>36}"
     lines.append(header)
     lines.append("-" * len(header))
     for e in stage2_eliminated:
@@ -1803,7 +1817,7 @@ def format_stage2_eliminated_table(stage2_eliminated):
         else:
             rr_str = f"{rr:.2f}x"
             reason = f"below the {REWARD_RISK_MINIMUM} floor"
-        lines.append(f"{e['ticker']:8}{e['base_score']:>6}/55{rr_str:>14}{reason:>36}")
+        lines.append(f"{e['ticker']:8}{e['drop_pct']:>+8.2f}%{rr_str:>14}{reason:>36}")
     return "\n".join(lines)
 
 
@@ -1876,13 +1890,12 @@ def format_full_universe_table(indicators, stage1_tickers):
 def format_watchlist_table(watchlist, indicators, scores):
     lines = []
     header = (
-        f"{'TICKER':8}{'SCORE':>9}{'TREND':>8}{'MOM':>6}{'EARN':>6}{'LOC':>7}"
-        f"{'PRICE':>10}{'20EMA':>9}{'50EMA':>9}{'RSI':>7}{'VOLx(20d)':>11}"
-        f"{'LAST PIV HI':>12}{'LAST PIV LO':>12}{'EARN(days)':>12}"
+        f"{'TICKER':8}{'DROP %':>9}{'WINDOW':>8}{'R:R':>7}"
+        f"{'PRICE':>10}{'RSI':>7}{'VOLx(20d)':>11}{'EARN(days)':>12}"
     )
     lines.append(header)
     lines.append("-" * len(header))
-    for ticker in sorted(watchlist, key=lambda t: scores.get(t, {}).get("total", 0), reverse=True):
+    for ticker in sorted(watchlist, key=lambda t: scores.get(t, {}).get("drop_pct", 0)):
         ind = indicators.get(ticker)
         s = scores.get(ticker)
         if not ind or not s:
@@ -1890,18 +1903,9 @@ def format_watchlist_table(watchlist, indicators, scores):
             continue
         days = s["earnings_days_away"]
         days_str = str(days) if days is not None else "n/a"
-        pivot_hi = ind["latest_pivot_high"]
-        pivot_lo = ind["latest_pivot_low"]
-        pivot_hi_str = f"{pivot_hi:.2f}" if pivot_hi is not None else "n/a"
-        pivot_lo_str = f"{pivot_lo:.2f}" if pivot_lo is not None else "n/a"
-        hh_flag = "HH" if ind["higher_highs"] else "--"
-        hl_flag = "HL" if ind["higher_lows"] else "--"
         lines.append(
-            f"{ticker:8}{s['total']:>6}/85{s['trend']:>7}/25{s['momentum']:>5}/20"
-            f"{s['earnings']:>5}/10{s['location']:>5}/30"
-            f"{ind['price']:>10.2f}{ind['ema20']:>9.2f}{ind['ema50']:>9.2f}"
-            f"{ind['rsi']:>7.1f}{(ind['vol_ratio'] or 0):>11.2f}"
-            f"{pivot_hi_str:>10}{hh_flag:>2}{pivot_lo_str:>10}{hl_flag:>2}{days_str:>12}"
+            f"{ticker:8}{s['drop_pct']:>+8.2f}%{s['drop_window']:>8}{s['reward_risk']:>6.2f}x"
+            f"{ind['price']:>10.2f}{ind['rsi']:>7.1f}{(ind['vol_ratio'] or 0):>11.2f}{days_str:>12}"
         )
     return "\n".join(lines) if watchlist else "(watchlist is empty)"
 
@@ -2269,42 +2273,18 @@ def main():
     weekend = is_weekend()
     data_quality_alerts = []
 
-    # --- Holdings: Trade Journal (Excel, via Drive) is the source of truth.
-    #     portfolio.json's "holdings" list is only used as a fallback if the
-    #     Drive read fails, so the pipeline still runs on a bad network day. ---
-    holdings = portfolio.get("holdings", [])
-    try:
-        download_workbook(TRADE_PLANNER_LOCAL)
-        journal_holdings = read_holdings_from_trade_journal(TRADE_PLANNER_LOCAL, market=TRADE_PLANNER_MARKET)
-        holdings = journal_holdings
-        portfolio["holdings"] = journal_holdings  # keep the fallback cache fresh for the next run
-    except Exception as e:
-        clean = humanize_exception("Trade Journal holdings read", e)
-        data_quality_alerts.append(
-            f"Trade Journal holdings read failed, using portfolio.json holdings as fallback - {clean}"
-        )
+    # --- Portfolio Actions removed per user request: no more reading
+    #     holdings from the Trade Journal tab, and no qualitative
+    #     Claude+web-search read on them. holdings/holdings_tickers stay as
+    #     empty lists so downstream functions (screen_watchlist,
+    #     select_weekly_universe, decision summary) that still accept a
+    #     holdings argument degrade to "no holdings" cleanly rather than
+    #     needing their signatures changed. ---
+    holdings = []
+    holdings_tickers = []
+    portfolio_action_count = 0
 
-    holdings_tickers = [h["ticker"] for h in holdings]
-
-    # --- Holdings: live price + qualitative hold/sell read ---
-    snapshots = {h["ticker"]: fetch_snapshot(h["ticker"]) for h in holdings}
-    holdings_rows, total_cost, total_value = build_holdings_table(holdings, snapshots)
-    holdings_table = format_holdings_table(holdings_rows) if holdings_rows else ""
-
-    try:
-        analysis, verdicts = get_claude_analysis(holdings_rows, total_cost, total_value)
-    except Exception as e:
-        clean = humanize_exception("holdings analysis", e)
-        analysis = f"Holdings analysis unavailable - {clean}"
-        verdicts = {}
-        data_quality_alerts.append(f"Holdings analysis unavailable - {clean}")
-
-    portfolio_action_count = sum(1 for v in verdicts.values() if v != "HOLD")
-
-    # --- Watchlist: auto-remove anything now actually owned ---
-    auto_removed = [t for t in watchlist_us if t in holdings_tickers]
-    watchlist_us = [t for t in watchlist_us if t not in holdings_tickers]
-    changes_log = [f"- Removed {t}: now an actual holding, tracked there instead" for t in auto_removed]
+    changes_log = []
 
     # --- Weekend-only: re-score the full master pool and pick the new
     #     active universe for the week ahead. Weekdays just reuse whatever
@@ -2352,16 +2332,7 @@ def main():
 
     watchlist_table = format_watchlist_table(watchlist_us, indicators, scores)
     stage1_tickers = {c["ticker"] for c in stage1_shortlist}
-
-    # Holdings are deliberately excluded from `indicators` above (they can't
-    # be "candidates" for a watchlist they're already in) - but the user
-    # wants them visible in the snapshot table regardless. Fetch their
-    # technicals separately and merge in just for the table.
-    try:
-        holdings_indicators = compute_technical_indicators(holdings_tickers) if holdings_tickers else {}
-    except Exception:
-        holdings_indicators = {}
-    snapshot_indicators = {**indicators, **holdings_indicators}
+    snapshot_indicators = indicators  # holdings tracking removed, so no separate merge needed
     full_universe_table = format_full_universe_table(snapshot_indicators, stage1_tickers)
     levels_table = format_levels_table(watchlist_us, indicators)
 
@@ -2457,20 +2428,16 @@ def main():
     # --- New Trade Candidates: setup status (always Qualified for this list)
     #     vs execution status (can we actually size/act on it today) ---
     candidate_lines = []
-    for ticker in sorted(watchlist_us, key=lambda t: scores.get(t, {}).get("total", 0), reverse=True):
+    for ticker in sorted(watchlist_us, key=lambda t: scores.get(t, {}).get("drop_pct", 0)):
         s = scores.get(ticker, {})
         fixed_plan = trade_plans.get(ticker)
         exec_status = get_execution_status(ticker, trade_plans, atr_trade_plans)
         rr = fixed_plan["reward_risk"] if fixed_plan else "n/a"
         candidate_lines.append(
-            f"{ticker}: score {s.get('total', 'n/a')}/85 | Setup status: Qualified | "
+            f"{ticker}: down {s.get('drop_pct', 'n/a')}% ({s.get('drop_window', 'n/a')}) | Setup status: Qualified | "
             f"Execution status: {exec_status} | Fixed-buffer reward:risk: {rr}x"
         )
     candidates_summary = "\n".join(candidate_lines) if candidate_lines else "(none)"
-
-    holdings_section = (
-        f"{holdings_table}\n\n{analysis}" if holdings_rows else "Current holdings: None\n\n" + analysis
-    )
 
     body = f"""{report_label} - {datetime.now().strftime('%A, %d %B %Y')}
 
@@ -2484,17 +2451,9 @@ Generated: {datetime.now().strftime('%d %b %Y, %H:%M')} (server time)
 {decision_summary}
 
 ====================================================
-2. PORTFOLIO ACTIONS
+2. NEW TRADE CANDIDATES
 ====================================================
-Current holdings: {len(holdings)}
-Portfolio actions required: {portfolio_action_count}
-
-{holdings_section}
-
-====================================================
-3. NEW TRADE CANDIDATES
-====================================================
-Qualification: base score >= {BASE_SCORE_MINIMUM}/55 and reward:risk >= {REWARD_RISK_MINIMUM}x. Full methodology in the repo README.
+Qualification: dropped {abs(DROP_THRESHOLD_PCT):.0f}%+ within the last 24-72 hours (1-3 trading days) and reward:risk >= {REWARD_RISK_MINIMUM}x. Full methodology in the repo README.
 
 {candidates_summary}
 
@@ -2514,7 +2473,7 @@ Qualification: base score >= {BASE_SCORE_MINIMUM}/55 and reward:risk >= {REWARD_
 {trade_planner_status}
 
 ====================================================
-4. REJECTED / WATCH NAMES
+3. REJECTED / WATCH NAMES
 ====================================================
 Stage 1 passed: {len(stage1_shortlist)}
 Rejected on reward:risk: {len(stage2_eliminated)}
@@ -2527,12 +2486,12 @@ Changes today:
 {changes_text}
 
 ====================================================
-5. WEEKLY UNIVERSE REVIEW
+4. WEEKLY UNIVERSE REVIEW
 ====================================================
 {universe_review_section}
 
 ====================================================
-6. FULL UNIVERSE SNAPSHOT ({len(snapshot_indicators)} tickers)
+5. FULL UNIVERSE SNAPSHOT ({len(snapshot_indicators)} tickers)
 ====================================================
 Every ticker in the active universe, technicals only - nothing filtered out.
 Holdings are always included here even if excluded from the watchlist screen itself.
@@ -2540,7 +2499,7 @@ Holdings are always included here even if excluded from the watchlist screen its
 {full_universe_table}
 
 ====================================================
-7. OVERNIGHT / POST-MARKET MOVERS
+6. OVERNIGHT / POST-MARKET MOVERS
 ====================================================
 Every active-universe ticker's move vs previous close, in whichever extended-hours
 session has data right now (post-market in the evening, pre-market the next morning).
@@ -2549,12 +2508,12 @@ Sorted biggest drop first. \U0001F534 flags a drop of 2%+.
 {overnight_movers_section}
 
 ====================================================
-8. MARKET AND PRE-MARKET VALIDATION
+7. MARKET AND PRE-MARKET VALIDATION
 ====================================================
 {premarket_section}
 
 ====================================================
-9. DATA-QUALITY ALERTS
+8. DATA-QUALITY ALERTS
 ====================================================
 {data_quality_text}
 
