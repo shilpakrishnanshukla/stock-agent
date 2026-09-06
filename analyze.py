@@ -511,12 +511,16 @@ def fetch_overnight_move(ticker):
 
 
 def build_overnight_movers(tickers, drop_threshold_pct=-2.0):
-    """Scans every given ticker for its extended-hours move and returns
-    (movers, no_data_count) where movers is a list of result dicts sorted
-    most-negative-first (biggest drops first) - includes ALL tickers with
-    data, not just those past the threshold, so nothing is hidden; the
-    threshold only affects the "notable drops" callout in the formatter."""
+    """Scans every given ticker for its extended-hours move. Returns
+    (movers, no_data_count, movers_by_ticker):
+      movers          - list of result dicts, sorted most-negative-first
+      no_data_count   - how many tickers had no extended-hours data
+      movers_by_ticker - {ticker: result_dict}, for merging into another
+                         table (e.g. the Full Universe Snapshot) by lookup
+    Includes ALL tickers with data, not just those past the threshold, so
+    nothing is hidden; the threshold only affects the "notable drops" count."""
     movers = []
+    movers_by_ticker = {}
     no_data = 0
     for ticker in tickers:
         result = fetch_overnight_move(ticker)
@@ -524,8 +528,9 @@ def build_overnight_movers(tickers, drop_threshold_pct=-2.0):
             no_data += 1
             continue
         movers.append(result)
+        movers_by_ticker[ticker] = result
     movers.sort(key=lambda m: m["move_pct"])
-    return movers, no_data
+    return movers, no_data, movers_by_ticker
 
 
 def format_overnight_movers_section(movers, no_data_count, drop_threshold_pct=-2.0):
@@ -552,7 +557,7 @@ def format_overnight_movers_section(movers, no_data_count, drop_threshold_pct=-2
     return "\n".join(lines)
 
 
-
+def build_premarket_gaps(watchlist):
     """Fetches pre-market gap data for the final shortlisted tickers, then
     gets an explanation for any that gapped significantly (status other than
     'OK'). Returns {ticker: gap_dict_or_None}, with an 'explanation' key
@@ -1852,14 +1857,21 @@ def build_ticker_flags(ind, in_stage1_shortlist):
     return "".join(flags) if flags else "-"
 
 
-def format_full_universe_table(indicators, stage1_tickers):
+def format_full_universe_table(indicators, stage1_tickers, overnight_moves=None):
     """Every ticker in today's screening universe, technicals only - no
-    scoring gate applied, so nothing is hidden. Sorted alphabetically."""
+    scoring gate applied, so nothing is hidden. Sorted alphabetically.
+
+    overnight_moves: optional {ticker: fetch_overnight_move()-result} dict -
+    when given, each row gets two extra trailing columns (extended-hours
+    move % and which session it came from) instead of a separate table."""
+    overnight_moves = overnight_moves or {}
     lines = []
     header = (
         f"{'TICKER':8}{'PRICE':>9}{'EMA20':>9}{'EMA50':>9}{'RSI14':>8}"
         f"{'ATR14($)':>10}{'ATR%':>7}  {'TREND':8}  FLAGS"
     )
+    if overnight_moves:
+        header += f"  {'EXT MOVE%':>9}  SESSION"
     lines.append(header)
     lines.append("-" * len(header))
     no_data = []
@@ -1872,17 +1884,27 @@ def format_full_universe_table(indicators, stage1_tickers):
         flags = build_ticker_flags(ind, ticker in stage1_tickers)
         atr14_str = f"{ind['atr14']:.2f}" if ind["atr14"] is not None else "n/a"
         atr_pct_str = f"{ind['atr_pct']:.1f}%" if ind["atr_pct"] is not None else "n/a"
-        lines.append(
+        row = (
             f"{ticker:8}{ind['price']:>9.2f}{ind['ema20']:>9.2f}{ind['ema50']:>9.2f}"
-            f"{ind['rsi']:>8.1f}{atr14_str:>10}{atr_pct_str:>7}  {trend:8}  {flags}"
+            f"{ind['rsi']:>8.1f}{atr14_str:>10}{atr_pct_str:>7}  {trend:8}  {flags:6}"
         )
+        if overnight_moves:
+            move = overnight_moves.get(ticker)
+            if move:
+                drop_flag = " \U0001F534" if move["move_pct"] <= -2.0 else ""
+                row += f"  {move['move_pct']:>+8.2f}%  {move['session']}{drop_flag}"
+            else:
+                row += f"  {'n/a':>9}  -"
+        lines.append(row)
     table = "\n".join(lines)
     legend = (
         "Legend: \U0001F7E2 Price>EMA20>EMA50 (bullish align)  "
-        "\U0001F7E1 RSI 50-70  \U0001F534 RSI>75 (overbought)  "
+        "\U0001F7E1 RSI 50-70  \U0001F534 RSI>75 (overbought) or EXT MOVE<=-2%  "
         "\U0001F535 ATR%>4 (elevated volatility)  "
         "\u2B50 cleared today's Stage 1 screen (base score >= 45/55)"
     )
+    if overnight_moves:
+        legend += "\nEXT MOVE% / SESSION: latest extended-hours move vs previous close (post-market evenings, pre-market mornings)."
     no_data_note = f"\nNo data today: {', '.join(no_data)}" if no_data else ""
     return f"{table}\n\n{legend}{no_data_note}"
 
@@ -2333,18 +2355,20 @@ def main():
     watchlist_table = format_watchlist_table(watchlist_us, indicators, scores)
     stage1_tickers = {c["ticker"] for c in stage1_shortlist}
     snapshot_indicators = indicators  # holdings tracking removed, so no separate merge needed
-    full_universe_table = format_full_universe_table(snapshot_indicators, stage1_tickers)
-    levels_table = format_levels_table(watchlist_us, indicators)
 
     # --- Overnight / post-market movers: same ticker set as the snapshot
-    #     table above, scanned for extended-hours drops vs previous close. ---
+    #     table, merged into it as trailing columns rather than a separate
+    #     table. ---
     try:
-        overnight_movers, overnight_no_data = build_overnight_movers(sorted(snapshot_indicators.keys()))
-        overnight_movers_section = format_overnight_movers_section(overnight_movers, overnight_no_data)
+        _, overnight_no_data, overnight_moves_by_ticker = build_overnight_movers(sorted(snapshot_indicators.keys()))
     except Exception as e:
         clean = humanize_exception("overnight movers scan", e)
-        overnight_movers_section = f"Overnight movers scan unavailable - {clean}"
+        overnight_moves_by_ticker = {}
+        overnight_no_data = 0
         data_quality_alerts.append(f"Overnight movers scan unavailable - {clean}")
+
+    full_universe_table = format_full_universe_table(snapshot_indicators, stage1_tickers, overnight_moves_by_ticker)
+    levels_table = format_levels_table(watchlist_us, indicators)
 
     trade_settings = portfolio["trade_settings"]
     trade_plans = build_trade_plans(watchlist_us, indicators, trade_settings)
@@ -2489,27 +2513,19 @@ Changes today:
 ====================================================
 5. FULL UNIVERSE SNAPSHOT ({len(snapshot_indicators)} tickers)
 ====================================================
-Every ticker in the active universe, technicals only - nothing filtered out.
+Every ticker in the active universe, technicals plus the latest extended-hours
+move (post-market in the evening, pre-market the next morning) - nothing filtered out.
 Holdings are always included here even if excluded from the watchlist screen itself.
 
 {full_universe_table}
 
 ====================================================
-6. OVERNIGHT / POST-MARKET MOVERS
-====================================================
-Every active-universe ticker's move vs previous close, in whichever extended-hours
-session has data right now (post-market in the evening, pre-market the next morning).
-Sorted biggest drop first. \U0001F534 flags a drop of 2%+.
-
-{overnight_movers_section}
-
-====================================================
-7. MARKET AND PRE-MARKET VALIDATION
+6. MARKET AND PRE-MARKET VALIDATION
 ====================================================
 {premarket_section}
 
 ====================================================
-8. DATA-QUALITY ALERTS
+7. DATA-QUALITY ALERTS
 ====================================================
 {data_quality_text}
 
