@@ -2381,10 +2381,6 @@ def main():
             premarket_section = f"Pre-market gap check unavailable - {clean}"
             data_quality_alerts.append(f"Pre-market gap check unavailable - {clean}")
 
-    overall_pl_pct = (
-        round((total_value - total_cost) / total_cost * 100, 2) if total_cost else 0
-    )
-
     # --- Decision summary: the single most important message, stated first ---
     decision_summary = build_decision_summary(
         holdings, portfolio_action_count, watchlist_us, scores, trade_plans,
