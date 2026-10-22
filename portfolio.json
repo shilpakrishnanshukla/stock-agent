@@ -11,7 +11,15 @@
       "cost_basis": 40.5
     }
   ],
-  "watchlist_us": [],
+  "watchlist_us": [
+    "AEM",
+    "INTC",
+    "MU",
+    "ASML",
+    "NEM",
+    "TSM",
+    "AMZN"
+  ],
   "closed_positions": [],
   "trade_settings": {
     "portfolio_value": 10000,
